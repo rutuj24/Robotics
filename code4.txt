@@ -1,0 +1,113 @@
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+import math
+import numpy as np
+
+class SquareControllerOdom(Node):
+    def __init__(self):
+        super().__init__('square_controller_odom')
+        
+        # Publisher for velocity commands
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
+        
+        # Subscriber to odometry data
+        self.subscription = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            10)
+            
+        # Node parameters
+        self.side_length = 1.0  # meters
+        self.linear_speed = 0.2  # m/s
+        self.angular_speed = 0.5  # rad/s
+        
+        # State variables
+        self.current_pose = None
+        self.initial_pose = None
+        self.odom_received = False
+
+        self.get_logger().info('Odometry-based Square Controller has been started.')
+        self.get_logger().info('Waiting for initial odometry message...')
+
+        # A timer to start the movement logic after we are sure we have odometry
+        self.create_timer(1.0, self.start_movement_logic)
+
+    def odom_callback(self, msg):
+        """Callback function for the /odom subscriber."""
+        self.current_pose = msg.pose.pose
+        if not self.odom_received:
+            self.initial_pose = self.current_pose
+            self.odom_received = True
+            self.get_logger().info('Initial odometry received.')
+
+    def quaternion_to_yaw(self, q):
+        """Convert a quaternion to a yaw angle (rotation around z-axis)."""
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def start_movement_logic(self):
+        """Contains the main state machine for moving in a square."""
+        if not self.odom_received:
+            self.get_logger().warn('Odometry not received yet, skipping movement logic.')
+            return
+
+        # Destroy the timer so this logic only runs once
+        self.destroy_timer(self.timers[0])
+        
+        self.get_logger().info('Starting square movement...')
+        
+        for i in range(4):
+            # --- Move Forward ---
+            self.get_logger().info(f'Moving forward for side {i+1}')
+            start_pose = self.current_pose
+            distance_traveled = 0.0
+            self.publish_cmd(self.linear_speed, 0.0)
+            
+            while distance_traveled < self.side_length:
+                rclpy.spin_once(self) # Process callbacks to update self.current_pose
+                distance_traveled = math.sqrt(
+                    (self.current_pose.position.x - start_pose.position.x)**2 +
+                    (self.current_pose.position.y - start_pose.position.y)**2
+                )
+            self.publish_cmd(0.0, 0.0) # Stop
+            self.get_logger().info(f'Side {i+1} complete.')
+            rclpy.sleep(1) # Pause for clarity
+            
+            # --- Turn ---
+            self.get_logger().info(f'Turning for corner {i+1}')
+            start_yaw = self.quaternion_to_yaw(self.current_pose.orientation)
+            target_yaw = start_yaw + math.pi / 2
+            # Normalize angle to be within [-pi, pi]
+            target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
+            
+            self.publish_cmd(0.0, self.angular_speed)
+            
+            while abs(self.quaternion_to_yaw(self.current_pose.orientation) - target_yaw) > 0.05: # Tolerance
+                rclpy.spin_once(self) # Process callbacks
+            
+            self.publish_cmd(0.0, 0.0) # Stop
+            self.get_logger().info(f'Turn {i+1} complete.')
+            rclpy.sleep(1) # Pause for clarity
+
+        self.get_logger().info('Square complete. Shutting down.')
+        rclpy.shutdown()
+
+    def publish_cmd(self, linear_x, angular_z):
+        """Publishes a Twist message."""
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.angular.z = float(angular_z)
+        self.publisher_.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+    square_controller_odom = SquareControllerOdom()
+    rclpy.spin(square_controller_odom)
+    square_controller_odom.destroy_node()
+
+if __name__ == '__main__':
+    main()
