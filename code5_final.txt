@@ -2,7 +2,6 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from tf_transformations import euler_from_quaternion
 import math
 
 class SquareMover(Node):
@@ -11,9 +10,9 @@ class SquareMover(Node):
         super().__init__('square_mover')
         
         # --- Parameters ---
-        self.side_length = 2.0  # Length of the square side in meters
+        self.side_length = 1  # Length of the square side in meters
         self.linear_speed = 0.2 # Linear speed in m/s
-        self.angular_speed = 0.5 # Angular speed in rad/s
+        self.angular_speed = 0.2 # Angular speed in rad/s
         self.angle_tolerance = 0.01 # Tolerance for reaching target angle (in radians)
 
         # --- Publisher and Subscriber ---
@@ -40,9 +39,15 @@ class SquareMover(Node):
         orientation_q = msg.pose.pose.orientation
         
         # Convert quaternion to Euler angles to get the yaw
-        _, _, self.current_yaw = euler_from_quaternion(
-            [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w])
-
+        x = orientation_q.x
+        y = orientation_q.y
+        z = orientation_q.z
+        w = orientation_q.w
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.current_yaw = yaw 
+        
         if self.start_position is None:
             self.start_position = self.current_position
             self.start_yaw = self.current_yaw
@@ -67,9 +72,9 @@ class SquareMover(Node):
             self.publisher_.publish(twist_msg)
         else:
             self.get_logger().info('Finished moving forward. Starting turn.')
-	    twist_msg = Twist()
-	    self.publisher_.publish(twist_msg)            
-	    self.current_state = 'TURNING'
+            twist_msg = Twist()
+            self.publisher_.publish(twist_msg)            
+            self.current_state = 'TURNING'
             # Record the angle at the start of the turn
             self.start_yaw = self.current_yaw
 
@@ -88,7 +93,7 @@ class SquareMover(Node):
         else:
             self.get_logger().info('Finished turning. Moving forward.')
             twist_msg = Twist()
-	    self.publisher_.publish(twist_msg)
+            self.publisher_.publish(twist_msg)
             self.current_state = 'MOVING_FORWARD'
             # Record the position at the start of the new side
             self.start_position = self.current_position
