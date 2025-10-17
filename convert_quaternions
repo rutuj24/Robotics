@@ -1,0 +1,45 @@
+import math # Make sure to import the math library at the top of your file
+
+# ... inside your odom_callback function ...
+def odom_callback(self, msg):
+    """
+    Callback function for the /odom subscriber.
+    This is the main logic loop for the state machine.
+    """
+    self.current_position = msg.pose.pose.position
+    orientation_q = msg.pose.pose.orientation
+    
+    # --- Manual Quaternion to Euler Conversion ---
+    x = orientation_q.x
+    y = orientation_q.y
+    z = orientation_q.z
+    w = orientation_q.w
+
+    # Roll (x-axis rotation)
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    # Pitch (y-axis rotation)
+    sinp = 2 * (w * y - z * x)
+    if abs(sinp) >= 1:
+        pitch = math.copysign(math.pi / 2, sinp) # Use 90 degrees if out of range
+    else:
+        pitch = math.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+    
+    # The rest of the odom_callback function remains the same...
+    self.current_yaw = yaw 
+
+    if self.start_position is None:
+        self.start_position = self.current_position
+        self.start_yaw = self.current_yaw
+
+    if self.current_state == 'MOVING_FORWARD':
+        self.move_forward()
+    elif self.current_state == 'TURNING':
+        self.turn()
