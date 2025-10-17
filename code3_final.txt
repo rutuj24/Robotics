@@ -17,10 +17,6 @@ class SquareController(Node):
         self.forward_duration = self.side_length / self.linear_speed
         self.turn_duration = 1.5708 / self.angular_speed # 90 degrees in radians is pi/2 ≈ 1.5708
         
-        self.get_logger().info('Square Controller Node has been started.')
-        self.get_logger().info(f'Side length: {self.side_length}m, Linear speed: {self.linear_speed}m/s')
-        self.get_logger().info(f'Move forward for {self.forward_duration:.2f}s, then turn for {self.turn_duration:.2f}s.')
-
         # Start the movement pattern
         self.move_square()
 
@@ -58,16 +54,13 @@ class SquareController(Node):
                 time.sleep(1.0) # A brief pause
             a=a+1
 
-        self.get_logger().info('Square complete. Shutting down.')
-        # Ensure the robot is stopped at the end
-        self.publish_cmd(0.0, 0.0)
-        rclpy.shutdown()
-
 def main(args=None):
     rclpy.init(args=args)
     square_controller = SquareController()
-    # The SquareController's move_square method will run until completion and then shutdown.
-    # No need for rclpy.spin() here as the logic is sequential and finite.
+    rclpy.spin(square_controller)
+
+    square_controller.destroy_node()
+    rclpy.shutdown()
     
 if __name__ == '__main__':
     main()
