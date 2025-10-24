@@ -1,0 +1,87 @@
+import rclpy
+from rclpy.node import Node
+
+from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Vector3
+from sensor_msgs.msg import LaserScan
+import numpy as np
+
+class Minitask1(Node):
+    
+    def __init__(self):
+        super().__init__('minitsak2')
+        self.direction_1 = 0.0
+        self.direction_2 = 0.0
+        self.direction_3 = 0.0
+        
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.move = Twist()
+        timer_period = 0.5  # seconds
+        self.timer = self.create_timer(timer_period, self.timer_callback)
+
+        #create the subscriber
+        self.subscription = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10)
+        self.subscription  # prevent unused variable warning
+    
+
+    #every 0.5 seconds
+    def timer_callback(self):
+        self.get_logger().info('Distance at direction_1: %s' % self.direction_1)
+        self.get_logger().info('Distance at direction_2: %s' % self.direction_2)
+        self.get_logger().info('Distance at direction_3: %s' % self.direction_3)
+        
+        self.wall_finder()
+        
+        if self.direction_1 < 1.0 :
+            self.move.linear.x = 0.0
+            self.move.angular.z = 0.2
+            self.publisher_.publish(self.move)
+        else :
+            self.move.linear.x = 0.2
+            self.move.angular.z = 0.0
+            self.publisher_.publish(self.move)
+            
+    def wall_finder(self):
+        valid_right = [r for r in self.wall_check_right if np.isfinite(r)]
+        valid_front = [r for r in self.wall_check_front if np.isfinite(r)]
+        valid_left = [r for r in self.wall_check_left if np.isfinite(r)]
+        sum_r = sum(valid_right)/(len(valid_right)+1)
+        sum_f = sum(valid_front)/(len(valid_front)+1)
+        sum_l = sum(valid_left)/(len(valid_left)+1)
+        
+        
+
+
+    def scan_callback(self, msg):
+        self.direction_1 = min( min(msg.ranges[:5]), min(msg.ranges[355:]))
+        self.direction_2 = min( min(msg.ranges[85:90]), min(msg.ranges[90:95]))
+        self.direction_3 = min( min(msg.ranges[265:270]), min(msg.ranges[270:275]))
+        
+        self.wall_check_left = msg.ranges[75:106]
+        self.wall_check_front = msg.ranges[345:] + msg.ranges[:16]
+        self.wall_check_right = msg.ranges[255:286]
+        
+
+
+    
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    mt = Minitask1()
+
+    rclpy.spin(mt)
+
+    # Destroy the node explicitly
+    # (optional - otherwise it will be done automatically
+    # when the garbage collector destroys the node object)
+    mt.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
