@@ -1,0 +1,155 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+import numpy as np
+
+# Define constants for control parameters
+LINEAR_SPEED = 0.3  # Constant forward speed (m/s)
+TARGET_DISTANCE = 0.7  # Target distance to maintain from the wall (meters)
+KP_ANGULAR = 1.0     # Proportional gain for angular velocity
+SCAN_SECTOR_SIZE = 120 # Degrees to check: 60 degrees to the left and right of the front
+
+class WallFollower(Node):
+    """
+    A ROS 2 Node that implements a simple wall-following behavior.
+
+    It subscribes to LaserScan data, finds the minimum distance in the front
+    sector, and uses a Proportional (P) controller to generate angular velocity
+    commands to steer away from the wall while maintaining a constant linear speed.
+    """
+    def __init__(self):
+        super().__init__('wall_follower')
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.subscriber = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10
+        )
+        self.get_logger().info('Wall Follower Node has started.')
+
+    def scan_callback(self, msg: LaserScan):
+        # 1. Determine the relevant sector indices
+        # We assume a 360-degree scan where index 0 is at 0 radians (forward).
+        # We want to check +/- (SCAN_SECTOR_SIZE / 2) degrees from the front.
+        
+        # Calculate angle resolution in degrees
+        angle_increment_deg = np.degrees(msg.angle_increment)
+        
+        # Calculate the number of indices corresponding to half the sector size
+        half_sector_indices = int((SCAN_SECTOR_SIZE / 2) / angle_increment_deg)
+        
+        # Total number of ranges
+        num_ranges = len(msg.ranges)
+        
+        # The relevant indices are split: front-left and wrap-around front-right
+        # Indices for the right side (0 to half_sector_indices)
+        front_right_indices = msg.ranges[:half_sector_indices]
+        
+        # Indices for the left side (num_ranges - half_sector_indices to num_ranges)
+        front_left_indices = msg.ranges[num_ranges - half_sector_indices:]
+
+        # Combine the relevant front sector ranges
+        front_ranges = list(front_left_indices) + list(front_right_indices)
+        
+        # Create a list of corresponding angles for the combined sector
+        # The angles range from -SCAN_SECTOR_SIZE/2 (right) to +SCAN_SECTOR_SIZE/2 (left)
+        # Note: We must skip indices that are inf or NaN
+        valid_ranges = []
+        valid_indices = []
+
+        # Find the minimum range and its original index (and implied angle)
+        min_distance = float('inf')
+        min_angle_index = -1
+        
+        # We combine and find the minimum distance and its *relative* index in the combined list
+        # We'll use the angle_min and angle_increment to map the index back to a real angle (rad)
+        
+        for i, r in enumerate(msg.ranges):
+            # Check if the range is valid (not infinity or NaN) and within the forward sector
+            
+            # Map index i to angle in degrees.
+            # ROS typically uses angle_min + i * angle_increment
+            angle_rad = msg.angle_min + i * msg.angle_increment
+            angle_deg = np.degrees(angle_rad)
+            
+            # Normalize angle_deg to -180 to 180 range
+            if angle_deg > 180:
+                angle_deg -= 360
+            
+            # Check if the angle is within the front sector (e.g., -60 to 60 degrees)
+            if abs(angle_deg) <= (SCAN_SECTOR_SIZE / 2):
+                if not np.isinf(r) and not np.isnan(r) and r > msg.range_min and r < msg.range_max:
+                    if r < min_distance:
+                        min_distance = r
+                        min_angle_index = i
+        
+        if min_angle_index == -1:
+            # No valid obstacles detected in the front sector, drive straight
+            self.move_robot(LINEAR_SPEED, 0.0)
+            self.get_logger().warn('No valid ranges in front sector. Driving straight.')
+            return
+
+        # 2. Calculate the corresponding angle for the minimum distance
+        min_angle_rad = msg.angle_min + min_angle_index * msg.angle_increment
+        
+        # Normalize the angle to be relative to the robot's front (0 to 2*PI, or -PI to PI)
+        # Since ROS LaserScan usually provides -pi to pi range, we use that directly
+        
+        # 3. Control Logic: P-Controller
+        
+        # Error in distance (for stopping/slowing down)
+        distance_error = TARGET_DISTANCE - min_distance
+        
+        # Angular error is derived from the angle of the closest point.
+        # If min_angle_rad is positive (left), we need to turn right (negative angular_z).
+        # If min_angle_rad is negative (right), we need to turn left (positive angular_z).
+        # The 'error' here is the angle itself, steering the robot away from the obstacle.
+        
+        # Proportional controller output for steering: Kp * angle
+        angular_z = -KP_ANGULAR * min_angle_rad
+
+        # 4. Determine Linear Velocity (slowing down as we get closer)
+        
+        # If the wall is too close, prioritize turning and slow down
+        if min_distance < TARGET_DISTANCE:
+            # Slow down linearly based on how close we are
+            linear_x = max(0.0, LINEAR_SPEED * (min_distance / TARGET_DISTANCE))
+            # If extremely close, prioritize sharp turn
+            angular_z = np.sign(angular_z) * min(abs(angular_z), 2.0) if abs(angular_z) > 0 else 1.0 # default turn left if centered
+            self.get_logger().info(f'Too close! Dist: {min_distance:.2f}. Steering: {angular_z:.2f}. Linear: {linear_x:.2f}')
+        else:
+            # Otherwise, drive at full speed and adjust steering to keep the obstacle centered
+            linear_x = LINEAR_SPEED
+            self.get_logger().info(f'Safe distance. Dist: {min_distance:.2f}. Steering: {angular_z:.2f}. Linear: {linear_x:.2f}')
+        
+        # 5. Publish the Twist message
+        self.move_robot(linear_x, angular_z)
+
+
+    def move_robot(self, linear_x, angular_z):
+        """
+        Creates and publishes a Twist message.
+        """
+        twist_msg = Twist()
+        twist_msg.linear.x = float(linear_x)
+        twist_msg.angular.z = float(angular_z)
+        self.publisher_.publish(twist_msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    wall_follower = WallFollower()
+    try:
+        rclpy.spin(wall_follower)
+    except KeyboardInterrupt:
+        wall_follower.get_logger().info('Wall Follower stopped by user.')
+        # Stop the robot on shutdown
+        wall_follower.move_robot(0.0, 0.0)
+    finally:
+        wall_follower.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
