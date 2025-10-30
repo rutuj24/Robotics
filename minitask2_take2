@@ -88,20 +88,27 @@ class WallFollower(Node):
              angle_alpha = math.atan2(dist_A * math.cos(angle_diff_rad) - dist_B, dist_A * math.sin(angle_diff_rad))
         
         # Calculate the Distance Error using the forward-most measurement (B)
+        # Positive error: Wall is too close
+        # Negative error: Wall is too far
         distance_error = TARGET_DISTANCE - dist_B
 
         # --- Control Logic (Base for Right-Hand Follow) ---
         
         # Component 1: Angle Correction (Turn to be parallel to the wall)
+        # Positive alpha (wall angles away) -> requires turning into the wall (negative angular_z)
         angle_correction = -KP_ANGLE * angle_alpha 
 
         # Component 2: Distance Correction (Turn to reach the target distance)
-        distance_correction = -KP_DISTANCE * distance_error
+        # FIX APPLIED HERE: For the RIGHT wall:
+        # If error is NEGATIVE (too far), correction must be NEGATIVE (turn RIGHT, towards wall).
+        # If error is POSITIVE (too close), correction must be POSITIVE (turn LEFT, away from wall).
+        distance_correction = KP_DISTANCE * distance_error
 
         angular_z = angle_correction + distance_correction
 
         # Invert logic for Left-Hand Following
         if side == 'LEFT':
+            # The base logic (right) is now correct. We negate it for the left side.
             angular_z = -angular_z
             
         return angular_z, angle_alpha, distance_error
