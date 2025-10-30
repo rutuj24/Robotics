@@ -3,20 +3,30 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 import numpy as np
+import math
 
-# Define constants for control parameters
-LINEAR_SPEED = 0.3  # Constant forward speed (m/s)
-TARGET_DISTANCE = 0.7  # Target distance to maintain from the wall (meters)
-KP_ANGULAR = 1.0     # Proportional gain for angular velocity
-SCAN_SECTOR_SIZE = 120 # Degrees to check: 60 degrees to the left and right of the front
+# --- Wall Following Parameters ---
+TARGET_DISTANCE = 0.55  # Target distance to maintain from the wall (meters)
+LINEAR_SPEED = 0.25     # Constant forward speed (m/s)
+KP_DISTANCE = 1.2       # Proportional gain for distance error
+KP_ANGLE = 1.5          # Proportional gain for angle error
+WALL_PRESENCE_THRESHOLD = 3.0 # Max distance to consider a wall 'present' (meters)
+
+# Sector definitions for Wall Following
+FRONT_AVOID_ANGLE = 45  # Degrees forward for immediate obstacle detection (+/- 45)
+
+# NOTE: All angle constants below are defined in DEGREES (0 to 360).
+A_ANGLE_RIGHT_DEG = 285 
+B_ANGLE_RIGHT_DEG = 330 
+
+A_ANGLE_LEFT_DEG = 75   
+B_ANGLE_LEFT_DEG = 30   
+# -----------------------------------
 
 class WallFollower(Node):
     """
-    A ROS 2 Node that implements a simple wall-following behavior.
-
-    It subscribes to LaserScan data, finds the minimum distance in the front
-    sector, and uses a Proportional (P) controller to generate angular velocity
-    commands to steer away from the wall while maintaining a constant linear speed.
+    A ROS 2 Node that implements a dual-sided Wall Following behavior, prioritizing 
+    the wall that is closer to the robot (or the right wall in a corridor).
     """
     def __init__(self):
         super().__init__('wall_follower')
@@ -27,104 +37,164 @@ class WallFollower(Node):
             self.scan_callback,
             10
         )
-        self.get_logger().info('Wall Follower Node has started.')
+        self.get_logger().info('Dual-Sided Wall Follower Node has started.')
+        self.last_twist = Twist() 
+
+    def get_index_for_angle(self, msg: LaserScan, angle_deg: float) -> int:
+        """
+        Helper function to convert a degree angle (0-360) to a laser scan index.
+        
+        CRITICAL ASSUMPTION: This relies on angle_min=0.0 and angle_increment=1 degree 
+        (or 0.017453 rad) for a direct index-to-degree mapping.
+        """
+        # 1. Normalize angle_deg to 0-359 range
+        normalized_angle_deg = int(angle_deg % 360)
+        
+        # 2. The index is the normalized degree value itself.
+        index = normalized_angle_deg
+        
+        # 3. Safety check to ensure index is within bounds [0, 359]
+        return min(max(index, 0), len(msg.ranges) - 1)
+
+    def get_safe_distance(self, ranges, index):
+        """Returns a valid distance, or a large value if invalid (e.g., infinity)."""
+        r = ranges[index]
+        if np.isinf(r) or np.isnan(r) or r <= 0.0:
+            return 100.0 
+        return r
+    
+    def calculate_steering(self, dist_A, dist_B, side):
+        """
+        Calculates the required angular velocity components based on two side measurements.
+        
+        Args:
+            dist_A (float): Rear measurement distance.
+            dist_B (float): Forward measurement distance.
+            side (str): 'RIGHT' or 'LEFT'
+        
+        Returns:
+            tuple: (Calculated angular Z velocity, angle_alpha, distance_error)
+        """
+        
+        # Angle difference between A and B is 45 degrees
+        angle_diff_rad = np.radians(abs(A_ANGLE_LEFT_DEG - B_ANGLE_LEFT_DEG)) 
+        
+        # Calculate angle of the wall relative to the robot's heading (angle_alpha)
+        # Positive alpha means the wall is angling away from the robot
+        if dist_A == 0.0 or dist_B == 0.0 or angle_diff_rad == 0:
+             angle_alpha = 0.0
+        else:
+             # Calculate the angle of the wall relative to the robot's heading
+             angle_alpha = math.atan2(dist_A * math.cos(angle_diff_rad) - dist_B, dist_A * math.sin(angle_diff_rad))
+        
+        # Calculate the Distance Error using the forward-most measurement (B)
+        distance_error = TARGET_DISTANCE - dist_B
+
+        # --- Control Logic (Base for Right-Hand Follow) ---
+        
+        # Component 1: Angle Correction (Turn to be parallel to the wall)
+        angle_correction = -KP_ANGLE * angle_alpha 
+
+        # Component 2: Distance Correction (Turn to reach the target distance)
+        distance_correction = -KP_DISTANCE * distance_error
+
+        angular_z = angle_correction + distance_correction
+
+        # Invert logic for Left-Hand Following
+        if side == 'LEFT':
+            angular_z = -angular_z
+            
+        return angular_z, angle_alpha, distance_error
+
 
     def scan_callback(self, msg: LaserScan):
-        # 1. Determine the relevant sector indices
-        # We assume a 360-degree scan where index 0 is at 0 radians (forward).
-        # We want to check +/- (SCAN_SECTOR_SIZE / 2) degrees from the front.
         
-        # Calculate angle resolution in degrees
-        angle_increment_deg = np.degrees(msg.angle_increment)
+        # --- Stage 1: Front Avoidance Check ---
         
-        # Calculate the number of indices corresponding to half the sector size
-        half_sector_indices = int((SCAN_SECTOR_SIZE / 2) / angle_increment_deg)
+        front_min_distance = float('inf')
         
-        # Total number of ranges
-        num_ranges = len(msg.ranges)
+        # Using the direct index property for front sector: indices 315-359 and 0-45
+        front_indices = list(range(0, FRONT_AVOID_ANGLE + 1)) + list(range(360 - FRONT_AVOID_ANGLE, 360))
         
-        # The relevant indices are split: front-left and wrap-around front-right
-        # Indices for the right side (0 to half_sector_indices)
-        front_right_indices = msg.ranges[:half_sector_indices]
+        for i in front_indices:
+            # Bounds check is redundant if using get_index_for_angle, but we check here for robustness
+            if i < len(msg.ranges):
+                r = msg.ranges[i]
+                if not np.isinf(r) and not np.isnan(r) and r > msg.range_min:
+                    front_min_distance = min(front_min_distance, r)
         
-        # Indices for the left side (num_ranges - half_sector_indices to num_ranges)
-        front_left_indices = msg.ranges[num_ranges - half_sector_indices:]
+        # Emergency Avoidance Logic
+        if front_min_distance < TARGET_DISTANCE / 2: 
+            # If obstacle is too close in front, turn sharply left (positive angular Z)
+            linear_x = 0.0
+            angular_z = 1.5 
+            self.get_logger().warn(f'EMERGENCY AVOIDANCE: {front_min_distance:.2f}m in front. Turning Left.')
+            self.move_robot(linear_x, angular_z)
+            return # Stop and turn
 
-        # Combine the relevant front sector ranges
-        front_ranges = list(front_left_indices) + list(front_right_indices)
-        
-        # Create a list of corresponding angles for the combined sector
-        # The angles range from -SCAN_SECTOR_SIZE/2 (right) to +SCAN_SECTOR_SIZE/2 (left)
-        # Note: We must skip indices that are inf or NaN
-        valid_ranges = []
-        valid_indices = []
+        # --- Stage 2: Wall Following Logic (Dual-Sided Check) ---
 
-        # Find the minimum range and its original index (and implied angle)
-        min_distance = float('inf')
-        min_angle_index = -1
+        # 2a. Get Side Measurements (Using the simplified index lookup)
         
-        # We combine and find the minimum distance and its *relative* index in the combined list
-        # We'll use the angle_min and angle_increment to map the index back to a real angle (rad)
+        # Right Side Measurements
+        idx_AR = self.get_index_for_angle(msg, A_ANGLE_RIGHT_DEG)
+        idx_BR = self.get_index_for_angle(msg, B_ANGLE_RIGHT_DEG)
+        dist_AR = self.get_safe_distance(msg.ranges, idx_AR)
+        dist_BR = self.get_safe_distance(msg.ranges, idx_BR)
         
-        for i, r in enumerate(msg.ranges):
-            # Check if the range is valid (not infinity or NaN) and within the forward sector
-            
-            # Map index i to angle in degrees.
-            # ROS typically uses angle_min + i * angle_increment
-            angle_rad = msg.angle_min + i * msg.angle_increment
-            angle_deg = np.degrees(angle_rad)
-            
-            # Normalize angle_deg to -180 to 180 range
-            if angle_deg > 180:
-                angle_deg -= 360
-            
-            # Check if the angle is within the front sector (e.g., -60 to 60 degrees)
-            if abs(angle_deg) <= (SCAN_SECTOR_SIZE / 2):
-                if not np.isinf(r) and not np.isnan(r) and r > msg.range_min and r < msg.range_max:
-                    if r < min_distance:
-                        min_distance = r
-                        min_angle_index = i
+        wall_on_right = dist_BR < WALL_PRESENCE_THRESHOLD
+
+        # Left Side Measurements
+        idx_AL = self.get_index_for_angle(msg, A_ANGLE_LEFT_DEG)
+        idx_BL = self.get_index_for_angle(msg, B_ANGLE_LEFT_DEG)
+        dist_AL = self.get_safe_distance(msg.ranges, idx_AL)
+        dist_BL = self.get_safe_distance(msg.ranges, idx_BL)
         
-        if min_angle_index == -1:
-            # No valid obstacles detected in the front sector, drive straight
+        wall_on_left = dist_BL < WALL_PRESENCE_THRESHOLD
+
+        # 2b. Wall Selection Logic
+        
+        target_side = 'NONE'
+        linear_x = LINEAR_SPEED
+        angular_z = 0.0
+        
+        if wall_on_right and wall_on_left:
+            # Corridor: Follow the side that is closer to the TARGET_DISTANCE (or right if equal)
+            right_error_abs = abs(TARGET_DISTANCE - dist_BR)
+            left_error_abs = abs(TARGET_DISTANCE - dist_BL)
+            
+            if right_error_abs <= left_error_abs:
+                 target_side = 'RIGHT'
+            else:
+                 target_side = 'LEFT'
+            self.get_logger().info(f'CORRIDOR DETECTED. Following {target_side}.')
+        
+        elif wall_on_right:
+            target_side = 'RIGHT'
+            self.get_logger().info('RIGHT wall detected. Following right.')
+            
+        elif wall_on_left:
+            target_side = 'LEFT'
+            self.get_logger().info('LEFT wall detected. Following left.')
+            
+        else:
+            # No wall detected within threshold, drive straight
+            self.get_logger().info('No walls detected. Driving straight.')
             self.move_robot(LINEAR_SPEED, 0.0)
-            self.get_logger().warn('No valid ranges in front sector. Driving straight.')
             return
 
-        # 2. Calculate the corresponding angle for the minimum distance
-        min_angle_rad = msg.angle_min + min_angle_index * msg.angle_increment
+        # 2c. Execute Control for Selected Wall
+        if target_side == 'RIGHT':
+            angular_z, angle_alpha, distance_error = self.calculate_steering(dist_AR, dist_BR, target_side)
+        elif target_side == 'LEFT':
+            angular_z, angle_alpha, distance_error = self.calculate_steering(dist_AL, dist_BL, target_side)
         
-        # Normalize the angle to be relative to the robot's front (0 to 2*PI, or -PI to PI)
-        # Since ROS LaserScan usually provides -pi to pi range, we use that directly
+        # Cap the angular speed for safe movement
+        angular_z = max(-2.0, min(2.0, angular_z))
         
-        # 3. Control Logic: P-Controller
+        self.get_logger().info(f'[{target_side}] Dist: {dist_BR if target_side == "RIGHT" else dist_BL:.2f}. Err: {distance_error:.2f}. Steering: {angular_z:.2f}')
         
-        # Error in distance (for stopping/slowing down)
-        distance_error = TARGET_DISTANCE - min_distance
-        
-        # Angular error is derived from the angle of the closest point.
-        # If min_angle_rad is positive (left), we need to turn right (negative angular_z).
-        # If min_angle_rad is negative (right), we need to turn left (positive angular_z).
-        # The 'error' here is the angle itself, steering the robot away from the obstacle.
-        
-        # Proportional controller output for steering: Kp * angle
-        angular_z = -KP_ANGULAR * min_angle_rad
-
-        # 4. Determine Linear Velocity (slowing down as we get closer)
-        
-        # If the wall is too close, prioritize turning and slow down
-        if min_distance < TARGET_DISTANCE:
-            # Slow down linearly based on how close we are
-            linear_x = max(0.0, LINEAR_SPEED * (min_distance / TARGET_DISTANCE))
-            # If extremely close, prioritize sharp turn
-            angular_z = np.sign(angular_z) * min(abs(angular_z), 2.0) if abs(angular_z) > 0 else 1.0 # default turn left if centered
-            self.get_logger().info(f'Too close! Dist: {min_distance:.2f}. Steering: {angular_z:.2f}. Linear: {linear_x:.2f}')
-        else:
-            # Otherwise, drive at full speed and adjust steering to keep the obstacle centered
-            linear_x = LINEAR_SPEED
-            self.get_logger().info(f'Safe distance. Dist: {min_distance:.2f}. Steering: {angular_z:.2f}. Linear: {linear_x:.2f}')
-        
-        # 5. Publish the Twist message
+        # 3. Publish the Twist message
         self.move_robot(linear_x, angular_z)
 
 
@@ -136,6 +206,7 @@ class WallFollower(Node):
         twist_msg.linear.x = float(linear_x)
         twist_msg.angular.z = float(angular_z)
         self.publisher_.publish(twist_msg)
+        self.last_twist = twist_msg
 
 
 def main(args=None):
