@@ -1,0 +1,213 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+import numpy as np
+import math
+
+# --- Wall Following Parameters ---
+TARGET_DISTANCE = 0.55  # Target distance to maintain from the wall (meters)
+LINEAR_SPEED = 0.25     # Constant forward speed (m/s)
+KP_DISTANCE = 1.2       # Proportional gain for distance error
+KP_ANGLE = 1.5          # Proportional gain for angle error
+WALL_PRESENCE_THRESHOLD = 3.0 # Max distance to consider a wall 'present' (meters)
+
+# Alignment Maneuver Parameters
+ALIGN_ANGULAR_Z = 0.5   # Fixed turning speed (rad/s) for alignment maneuver (turn left)
+
+# Sector definitions for Wall Following
+FRONT_AVOID_ANGLE = 45  # Degrees forward for immediate obstacle detection (+/- 45)
+
+# NOTE: All angle constants below are defined in DEGREES (0 to 360).
+# Right Side Angles (Defined but now only used for presence check)
+A_ANGLE_RIGHT_DEG = 285 
+B_ANGLE_RIGHT_DEG = 330 
+
+# Left Side Angles (Primary control source)
+A_ANGLE_LEFT_DEG = 75   
+B_ANGLE_LEFT_DEG = 30   
+# -----------------------------------
+
+class WallFollower(Node):
+    """
+    A ROS 2 Node that implements a Left-Side Wall Following behavior.
+    If a wall is only on the right, it executes a turn to align the wall to the left.
+    """
+    def __init__(self):
+        super().__init__('wall_follower')
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.subscriber = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            10
+        )
+        self.get_logger().info('Left-Side Priority Wall Follower Node has started.')
+        self.last_twist = Twist() 
+
+    def get_index_for_angle(self, msg: LaserScan, angle_deg: float) -> int:
+        """
+        Helper function to convert a degree angle (0-360) to a laser scan index.
+        
+        CRITICAL ASSUMPTION: This relies on angle_min=0.0 and angle_increment=1 degree 
+        for a direct index-to-degree mapping.
+        """
+        # 1. Normalize angle_deg to 0-359 range
+        normalized_angle_deg = int(angle_deg % 360)
+        
+        # 2. The index is the normalized degree value itself.
+        index = normalized_angle_deg
+        
+        # 3. Safety check to ensure index is within bounds [0, 359]
+        return min(max(index, 0), len(msg.ranges) - 1)
+
+    def get_safe_distance(self, ranges, index):
+        """Returns a valid distance, or a large value if invalid (e.g., infinity)."""
+        r = ranges[index]
+        if np.isinf(r) or np.isnan(r) or r <= 0.0:
+            return 100.0 
+        return r
+    
+    def calculate_steering(self, dist_A, dist_B, side):
+        """
+        Calculates the required angular velocity components based on two side measurements.
+        
+        Args:
+            dist_A (float): Rear measurement distance.
+            dist_B (float): Forward measurement distance.
+            side (str): Should always be 'LEFT' for this implementation.
+        
+        Returns:
+            tuple: (Calculated angular Z velocity, angle_alpha, distance_error)
+        """
+        
+        # Angle difference between A and B is 45 degrees
+        angle_diff_rad = np.radians(abs(A_ANGLE_LEFT_DEG - B_ANGLE_LEFT_DEG)) 
+        
+        # Calculate angle of the wall relative to the robot's heading (angle_alpha)
+        if dist_A == 0.0 or dist_B == 0.0 or angle_diff_rad == 0:
+             angle_alpha = 0.0
+        else:
+             # Calculate the angle of the wall relative to the robot's heading
+             angle_alpha = math.atan2(dist_A * math.cos(angle_diff_rad) - dist_B, dist_A * math.sin(angle_diff_rad))
+        
+        # Calculate the Distance Error using the forward-most measurement (B)
+        distance_error = TARGET_DISTANCE - dist_B
+
+        # --- Control Logic (Base for Right-Hand Follow) ---
+        
+        # Component 1: Angle Correction (Turn to be parallel to the wall)
+        angle_correction = -KP_ANGLE * angle_alpha 
+
+        # Component 2: Distance Correction (Turn to reach the target distance)
+        distance_correction = -KP_DISTANCE * distance_error
+
+        angular_z_base = angle_correction + distance_correction
+
+        # Invert logic for Left-Hand Following (since base logic assumes Right-hand)
+        angular_z = -angular_z_base
+            
+        return angular_z, angle_alpha, distance_error
+
+
+    def scan_callback(self, msg: LaserScan):
+        
+        # --- Stage 1: Front Avoidance Check ---
+        front_min_distance = float('inf')
+        
+        front_indices = list(range(0, FRONT_AVOID_ANGLE + 1)) + list(range(360 - FRONT_AVOID_ANGLE, 360))
+        
+        for i in front_indices:
+            if i < len(msg.ranges):
+                r = msg.ranges[i]
+                if not np.isinf(r) and not np.isnan(r) and r > msg.range_min:
+                    front_min_distance = min(front_min_distance, r)
+        
+        # Emergency Avoidance Logic
+        if front_min_distance < TARGET_DISTANCE / 2: 
+            linear_x = 0.0
+            angular_z = 1.5 # Turn sharply left
+            self.get_logger().warn(f'EMERGENCY AVOIDANCE: {front_min_distance:.2f}m in front. Turning Left.')
+            self.move_robot(linear_x, angular_z)
+            return # Stop and turn
+
+        # --- Stage 2: Wall Following Logic (Left-Side Priority) ---
+
+        # 2a. Get Side Measurements for Presence Check
+        
+        # Right Side Presence Check
+        idx_BR = self.get_index_for_angle(msg, B_ANGLE_RIGHT_DEG)
+        dist_BR = self.get_safe_distance(msg.ranges, idx_BR)
+        wall_on_right = dist_BR < WALL_PRESENCE_THRESHOLD
+
+        # Left Side Control Measurements
+        idx_AL = self.get_index_for_angle(msg, A_ANGLE_LEFT_DEG)
+        idx_BL = self.get_index_for_angle(msg, B_ANGLE_LEFT_DEG)
+        dist_AL = self.get_safe_distance(msg.ranges, idx_AL)
+        dist_BL = self.get_safe_distance(msg.ranges, idx_BL)
+        wall_on_left = dist_BL < WALL_PRESENCE_THRESHOLD
+
+        # 2b. Wall Selection Logic
+        
+        linear_x = LINEAR_SPEED
+        angular_z = 0.0
+        target_mode = 'NONE'
+
+        if wall_on_left:
+            # Case 1: Left wall is present (even if right is too), so follow it.
+            target_mode = 'FOLLOW_LEFT'
+            
+        elif wall_on_right:
+            # Case 2: Only right wall is present. Initiate alignment maneuver.
+            target_mode = 'ALIGN_LEFT'
+            
+        else:
+            # Case 3: No walls. Drive straight.
+            target_mode = 'NONE'
+            self.get_logger().info('No walls detected. Driving straight.')
+            self.move_robot(LINEAR_SPEED, 0.0)
+            return
+
+        # 2c. Execute Control for Selected Mode
+        if target_mode == 'FOLLOW_LEFT':
+            angular_z, angle_alpha, distance_error = self.calculate_steering(dist_AL, dist_BL, 'LEFT')
+            # Cap the angular speed for safe movement
+            angular_z = max(-2.0, min(2.0, angular_z))
+            self.get_logger().info(f'[FOLLOW LEFT] Dist: {dist_BL:.2f}. Err: {distance_error:.2f}. Steering: {angular_z:.2f}')
+            
+        elif target_mode == 'ALIGN_LEFT':
+            # Turn Left continuously to bring the right wall into the left view
+            angular_z = ALIGN_ANGULAR_Z 
+            linear_x = LINEAR_SPEED / 2.0 # Slow down while turning sharply
+            self.get_logger().info(f'[ALIGNING] Right Wall detected only. Turning Left at {angular_z} rad/s.')
+            
+        # 3. Publish the Twist message
+        self.move_robot(linear_x, angular_z)
+
+
+    def move_robot(self, linear_x, angular_z):
+        """
+        Creates and publishes a Twist message.
+        """
+        twist_msg = Twist()
+        twist_msg.linear.x = float(linear_x)
+        twist_msg.angular.z = float(angular_z)
+        self.publisher_.publish(twist_msg)
+        self.last_twist = twist_msg
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    wall_follower = WallFollower()
+    try:
+        rclpy.spin(wall_follower)
+    except KeyboardInterrupt:
+        wall_follower.get_logger().info('Wall Follower stopped by user.')
+        # Stop the robot on shutdown
+        wall_follower.move_robot(0.0, 0.0)
+    finally:
+        wall_follower.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
