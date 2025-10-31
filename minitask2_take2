@@ -71,7 +71,7 @@ class Minitask2(Node):
             if self.state != State.AVOID_OBSTACLE:
                 self.state = State.AVOID_OBSTACLE
                 # Pick turn direction: away from closest wall
-                if self.left > self.right:
+                if self.front_left > self.front_right:
                     self.avoid_direction = 'left'
                 else:
                     self.avoid_direction = 'right'
