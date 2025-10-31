@@ -7,10 +7,10 @@ import math
 
 # --- Wall Following Parameters ---
 TARGET_DISTANCE = 0.55  # Target distance to maintain from the wall (meters)
-LINEAR_SPEED = 0.25     # Constant forward speed (m/s)
-KP_DISTANCE = 2.5       # Proportional gain for distance error (Increased to 2.5 for stronger correction)
-KP_ANGLE = 2.0          # Proportional gain for angle error (Increased to 2.0 for better alignment)
-WALL_PRESENCE_THRESHOLD = 10.0 # Max distance to consider a wall 'present' (meters) (Increased to 10.0)
+LINEAR_SPEED = 0.15     # Constant forward speed (m/s) (DECREASED for stability)
+KP_DISTANCE = 3.5       # Proportional gain for distance error (INCREASED to 3.5 for aggressive correction)
+KP_ANGLE = 2.0          # Proportional gain for angle error
+WALL_PRESENCE_THRESHOLD = 10.0 # Max distance to consider a wall 'present' (meters)
 
 # Alignment Maneuver Parameters
 ALIGN_ANGULAR_Z = 0.5   # Fixed turning speed (rad/s) for alignment maneuver (turn left)
