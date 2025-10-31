@@ -92,22 +92,23 @@ class WallFollower(Node):
         # Negative error: Wall is too far
         distance_error = TARGET_DISTANCE - dist_B
 
-        # --- Component 1: Angle Correction ---
-        # If wall angles AWAY (alpha pos), robot must turn RIGHT (neg Z) regardless of side to parallel.
-        angle_correction = -KP_ANGLE * angle_alpha 
+        # --- Component 1: Angle Correction (Base) ---
+        # Right Side Rule: If wall angles AWAY (alpha pos), robot must turn RIGHT (neg Z) to parallel.
+        angle_correction_base = -KP_ANGLE * angle_alpha 
 
-        # --- Component 2: Distance Correction (Base for Right Side) ---
-        # If wall is TOO CLOSE (error pos), robot must turn LEFT (pos Z).
+        # --- Component 2: Distance Correction (Base) ---
+        # Right Side Rule: If wall is TOO CLOSE (error pos), robot must turn LEFT (pos Z) to move away.
         distance_correction_base = KP_DISTANCE * distance_error
 
         
         if side == 'RIGHT':
-            # Right side: Angle correction (Neg Z) + Distance correction (Pos Z)
-            angular_z = angle_correction + distance_correction_base
+            # Right side: Both corrections use the base sign conventions.
+            angular_z = angle_correction_base + distance_correction_base
         elif side == 'LEFT':
-            # Left side: Angle correction (Neg Z) + Distance correction (Neg Z)
-            # If wall is TOO CLOSE (error pos), robot must turn RIGHT (neg Z).
-            angular_z = angle_correction - distance_correction_base
+            # Left side: Both corrections must be inverted relative to the Right side base.
+            # Angle Correction: Turn LEFT (Pos Z) to parallel an AWAY-angling wall (alpha pos).
+            # Distance Correction: Turn RIGHT (Neg Z) to move away from a TOO-CLOSE wall (error pos).
+            angular_z = (-angle_correction_base) - distance_correction_base
             
         return angular_z, angle_alpha, distance_error
 
