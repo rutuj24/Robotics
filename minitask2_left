@@ -10,7 +10,7 @@ TARGET_DISTANCE = 0.55  # Target distance to maintain from the wall (meters)
 LINEAR_SPEED = 0.15     # Constant forward speed (m/s) (DECREASED for stability)
 KP_DISTANCE = 3.5       # Proportional gain for distance error (INCREASED to 3.5 for aggressive correction)
 KP_ANGLE = 2.0          # Proportional gain for angle error
-WALL_PRESENCE_THRESHOLD = 10.0 # Max distance to consider a wall 'present' (meters)
+WALL_PRESENCE_THRESHOLD = 100.0 # Max distance to consider a wall 'present' (meters) (INCREASED to 100.0)
 
 # Alignment Maneuver Parameters
 ALIGN_ANGULAR_Z = 0.5   # Fixed turning speed (rad/s) for alignment maneuver (turn left)
@@ -172,7 +172,7 @@ class WallFollower(Node):
         if target_mode == 'FOLLOW_LEFT':
             angular_z, angle_alpha, distance_error = self.calculate_steering(dist_AL, dist_BL, 'LEFT')
             # Cap the angular speed for safe movement
-            angular_z = max(-2.0, min(2.0, angular_z))
+            angular_z = max(-3.0, min(3.0, angular_z)) # Increased cap to 3.0
             self.get_logger().info(f'[FOLLOW LEFT] Dist: {dist_BL:.2f}. Err: {distance_error:.2f}. Steering: {angular_z:.2f}')
             
         elif target_mode == 'ALIGN_LEFT':
