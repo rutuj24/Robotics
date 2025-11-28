@@ -1,0 +1,190 @@
+#!/usr/bin/env python
+
+import rospy
+import actionlib
+import cv2
+import numpy as np
+import math
+from cv_bridge import CvBridge, CvBridgeError
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import PoseWithCovarianceStamped, Quaternion
+from visualization_msgs.msg import Marker
+from tf.transformations import quaternion_from_euler, euler_from_quaternion
+
+class ImageProcessor:
+    def __init__(self):
+        self.bridge = CvBridge()
+        # Subscribe to the robot's camera (adjust topic name if necessary, e.g., /camera/rgb/image_raw)
+        self.image_sub = rospy.Subscriber("/camera/rgb/image_raw", Image, self.image_callback)
+        self.marker_pub = rospy.Publisher("/found_object_markers", Marker, queue_size=10)
+        
+        # State variables
+        self.object_found = False
+        self.found_type = None  # "fire_hydrant" or "trash_can"
+        self.cv_image = None
+        
+        # Detection Threshold: How big must the object appear to stop? (pixels)
+        self.min_area = 30000 
+
+    def image_callback(self, data):
+        try:
+            self.cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+            self.process_image()
+        except CvBridgeError as e:
+            rospy.logerr(e)
+
+    def process_image(self):
+        if self.cv_image is None: return
+
+        # Convert to HSV
+        hsv = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2HSV)
+
+        # --- RED MASK (Fire Hydrant) ---
+        # Red wraps around 0/180, so we need two masks
+        lower_red1 = np.array([0, 100, 100])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 100, 100])
+        upper_red2 = np.array([180, 255, 255])
+        
+        mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask_red2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+
+        # --- GREEN MASK (Trash Can) ---
+        lower_green = np.array([40, 100, 100])
+        upper_green = np.array([80, 255, 255])
+        mask_green = cv2.inRange(hsv, lower_green, upper_green)
+
+        # Check for contours
+        if self.check_contour(mask_red):
+            self.found_type = "fire_hydrant"
+            self.object_found = True
+        elif self.check_contour(mask_green):
+            self.found_type = "trash_can"
+            self.object_found = True
+        else:
+            self.object_found = False
+            self.found_type = None
+
+    def check_contour(self, mask):
+        """Returns True if a contour in the mask is large enough."""
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_contour) > self.min_area:
+                return True
+        return False
+
+    def publish_marker(self, robot_pose):
+        """Publishes a marker 1 meter in front of the robot."""
+        if not self.found_type: return
+
+        # Calculate coordinates 1m in front of robot
+        # robot_pose is [x, y, theta]
+        obj_x = robot_pose[0] + 1.0 * math.cos(robot_pose[2])
+        obj_y = robot_pose[1] + 1.0 * math.sin(robot_pose[2])
+
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = rospy.Time.now()
+        marker.ns = "objects"
+        marker.id = int(rospy.Time.now().to_sec()) # Unique ID based on time
+        marker.type = Marker.CUBE
+        marker.action = Marker.ADD
+        marker.pose.position.x = obj_x
+        marker.pose.position.y = obj_y
+        marker.pose.position.z = 0.2
+        marker.scale.x = 0.3
+        marker.scale.y = 0.3
+        marker.scale.z = 0.3
+        marker.color.a = 1.0
+
+        if self.found_type == "fire_hydrant":
+            marker.color.r = 1.0; marker.color.g = 0.0; marker.color.b = 0.0
+            rospy.loginfo(f"FOUND RED OBJECT (Fire Hydrant) at {obj_x:.2f}, {obj_y:.2f}")
+        else:
+            marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0
+            rospy.loginfo(f"FOUND GREEN OBJECT (Trash Can) at {obj_x:.2f}, {obj_y:.2f}")
+
+        self.marker_pub.publish(marker)
+
+class HouseExplorer:
+    def __init__(self):
+        rospy.init_node('house_explorer_node')
+        
+        # Components
+        self.img_processor = ImageProcessor()
+        self.client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        
+        # Robot State
+        self.current_pose = [0, 0, 0] # x, y, theta
+        rospy.Subscriber("/amcl_pose", PoseWithCovarianceStamped, self.pose_callback)
+
+        rospy.loginfo("Waiting for move_base...")
+        self.client.wait_for_server()
+        rospy.loginfo("Connected.")
+
+        # Exploration Waypoints (Update these for your specific map!)
+        self.waypoints = [
+            (2.0, 0.5, 0.0),   
+            (1.5, -2.0, 1.57), 
+            (-1.0, 1.0, 3.14), 
+            (-2.5, -1.5, -1.57)
+        ]
+        
+        # Track found objects to avoid stuck loops
+        # Simple cooldown mechanism
+        self.last_found_time = rospy.Time.now()
+
+    def pose_callback(self, msg):
+        """Keep track of robot pose for marker calculation."""
+        orientation_q = msg.pose.pose.orientation
+        _, _, theta = euler_from_quaternion([orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w])
+        self.current_pose = [msg.pose.pose.position.x, msg.pose.pose.position.y, theta]
+
+    def run(self):
+        for i, (x, y, theta) in enumerate(self.waypoints):
+            goal = MoveBaseGoal()
+            goal.target_pose.header.frame_id = "map"
+            goal.target_pose.header.stamp = rospy.Time.now()
+            goal.target_pose.pose.position.x = x
+            goal.target_pose.pose.position.y = y
+            q = quaternion_from_euler(0, 0, theta)
+            goal.target_pose.pose.orientation = Quaternion(*q)
+
+            rospy.loginfo(f"Heading to Waypoint {i+1}...")
+            self.client.send_goal(goal)
+
+            # --- MONITORING LOOP ---
+            while self.client.get_state() in [actionlib.GoalStatus.PENDING, actionlib.GoalStatus.ACTIVE]:
+                # Check if object found and cooldown passed (5 seconds)
+                if self.img_processor.object_found and (rospy.Time.now() - self.last_found_time).to_sec() > 5.0:
+                    self.handle_object_found()
+                    
+                    # Optional: Resume to same waypoint or skip?
+                    # Here we re-send the goal to continue moving
+                    self.client.send_goal(goal) 
+                
+                rospy.sleep(0.1)
+            
+            result = self.client.get_result()
+            rospy.loginfo(f"Waypoint {i+1} complete.")
+
+    def handle_object_found(self):
+        """Stops robot, publishes marker, logs info."""
+        self.client.cancel_goal() # STOP the robot
+        rospy.sleep(1.0) # Wait for stop
+        
+        # Double check image is still there after stopping
+        if self.img_processor.object_found:
+            self.img_processor.publish_marker(self.current_pose)
+            self.last_found_time = rospy.Time.now() # Reset cooldown
+            rospy.sleep(2.0) # Admire the object for 2 seconds
+
+if __name__ == '__main__':
+    try:
+        explorer = HouseExplorer()
+        explorer.run()
+    except rospy.ROSInterruptException:
+        pass
