@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+
+import rospy
+import cv2
+import numpy as np
+from cv_bridge import CvBridge, CvBridgeError
+from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
+from sensor_msgs.msg import Image, LaserScan
+
+class SimpleSearch:
+    def __init__(self):
+        rospy.init_node('simple_search_node', anonymous=True)
+
+        # --- Publishers & Subscribers ---
+        self.vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.image_sub = rospy.Subscriber("/camera/rgb/image_raw", Image, self.image_callback)
+        self.scan_sub = rospy.Subscriber("/scan", LaserScan, self.scan_callback)
+        self.pose_sub = rospy.Subscriber("/amcl_pose", PoseWithCovarianceStamped, self.pose_callback)
+
+        # --- State Variables ---
+        self.bridge = CvBridge()
+        self.robot_pose = {'x': 0.0, 'y': 0.0}
+        self.obstacle_detected = False
+        self.object_found = False
+        self.found_type = None  # "red" or "green"
+        self.cv_image = None
+        
+        # --- Tuning Parameters ---
+        self.min_contour_area = 20000  # How close to get before stopping
+        self.safe_distance = 0.6       # Distance to wall (meters) to trigger a turn
+
+    def pose_callback(self, msg):
+        """Update robot's current map coordinates"""
+        self.robot_pose['x'] = msg.pose.pose.position.x
+        self.robot_pose['y'] = msg.pose.pose.position.y
+
+    def scan_callback(self, data):
+        """Check LIDAR for walls/obstacles in front"""
+        # Look at the front 60 degrees (approx)
+        # LaserScan arrays usually wrap. We take the front slice.
+        # Note: This assumes a 360 laser. Adjust indices if using a different robot.
+        front_ranges = data.ranges[0:30] + data.ranges[-30:]
+        
+        # Filter out "inf" (infinity) or 0.0 (error) readings
+        valid_ranges = [r for r in front_ranges if r > 0.05 and r < 10.0]
+        
+        if valid_ranges and min(valid_ranges) < self.safe_distance:
+            self.obstacle_detected = True
+        else:
+            self.obstacle_detected = False
+
+    def image_callback(self, data):
+        """Process camera data to find Red/Green objects"""
+        try:
+            self.cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        except CvBridgeError as e:
+            print(e)
+            return
+
+        hsv = cv2.cvtColor(self.cv_image, cv2.COLOR_BGR2HSV)
+
+        # 1. Define Color Ranges
+        # Red (0-10 and 170-180)
+        mask_r1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+        mask_r2 = cv2.inRange(hsv, np.array([170, 100, 100]), np.array([180, 255, 255]))
+        mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+        
+        # Green (40-80)
+        mask_green = cv2.inRange(hsv, np.array([40, 100, 100]), np.array([80, 255, 255]))
+
+        # 2. Check for substantial blobs of color
+        if self.check_contour(mask_red):
+            self.found_type = "Fire Hydrant (Red)"
+            self.object_found = True
+        elif self.check_contour(mask_green):
+            self.found_type = "Trash Can (Green)"
+            self.object_found = True
+        else:
+            self.object_found = False
+
+    def check_contour(self, mask):
+        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > self.min_contour_area:
+                return True
+        return False
+
+    def run(self):
+        """Main Control Loop"""
+        rate = rospy.Rate(10) # 10 Hz
+        print("Robot started. Searching...")
+
+        while not rospy.is_shutdown():
+            cmd = Twist()
+
+            if self.object_found:
+                # STATE 1: Object Found -> Stop and Report
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+                print(f"!!! FOUND {self.found_type} !!!")
+                print(f"Location on Map: X={self.robot_pose['x']:.2f}, Y={self.robot_pose['y']:.2f}")
+                
+                # To prevent endless spamming, we might want to pause or spin
+                # For this demo, we just stop.
+                
+            elif self.obstacle_detected:
+                # STATE 2: Obstacle/Wall -> Turn
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.5 # Turn left
+
+            else:
+                # STATE 3: Clear Path -> Drive Forward
+                cmd.linear.x = 0.2
+                cmd.angular.z = 0.0
+
+            self.vel_pub.publish(cmd)
+            rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        robot = SimpleSearch()
+        robot.run()
+    except rospy.ROSInterruptException:
+        pass
