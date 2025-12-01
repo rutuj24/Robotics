@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+# Import specific QoS settings for best compatibility with real sensors
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+import cv2
+import numpy as np
+from cv_bridge import CvBridge, CvBridgeError
+
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image, LaserScan
+from geometry_msgs.msg import PoseWithCovarianceStamped
+
+class SimpleSearch(Node):
+    def __init__(self):
+        super().__init__('simple_search_node')
+
+        # --- Quality of Service (QoS) ---
+        # Using BEST_EFFORT is crucial for real-world sensor data (cameras/lidar)
+        # to ensure we don't block waiting for dropped frames.
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # --- Publishers & Subscribers ---
+        self.vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        
+        # NEW: Debug image publisher
+        self.debug_pub = self.create_publisher(Image, '/camera/debug_masks', 10)
+
+        self.image_sub = self.create_subscription(Image, '/camera/rgb/image_raw', self.image_callback, sensor_qos)
+        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, sensor_qos)
+        # AMCL pose usually needs reliable QoS, default is fine
+        self.pose_sub = self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.pose_callback, 10)
+
+        # --- State Variables ---
+        self.bridge = CvBridge()
+        self.robot_pose = {'x': 0.0, 'y': 0.0}
+        self.obstacle_detected = False
+        self.object_found = False
+        self.found_type = None  # "red" or "green"
+        
+        # --- Tuning Parameters ---
+        self.min_contour_area = 20000 
+        self.safe_distance = 0.6        
+
+        # --- Timer (Control Loop) ---
+        self.timer = self.create_timer(0.1, self.control_loop) # 10Hz
+        self.get_logger().info("ROS 2 Robot started with Green/Red debug support.")
+
+    def pose_callback(self, msg):
+        self.robot_pose['x'] = msg.pose.pose.position.x
+        self.robot_pose['y'] = msg.pose.pose.position.y
+
+    def scan_callback(self, data):
+        scan_range = 30
+        if len(data.ranges) > scan_range * 2:
+            # Slice the front ~60 degrees
+            front_ranges = data.ranges[0:scan_range] + data.ranges[-scan_range:]
+            
+            # Filter valid readings (inf or nan often appear as 0.0 or very high numbers)
+            # Adjust max range (10.0) based on your specific lidar hardware
+            valid_ranges = [r for r in front_ranges if r > 0.05 and r < 10.0]
+            
+            if valid_ranges and min(valid_ranges) < self.safe_distance:
+                self.obstacle_detected = True
+            else:
+                self.obstacle_detected = False
+
+    def image_callback(self, data):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        except CvBridgeError as e:
+            self.get_logger().error(f"CV Bridge Error: {e}")
+            return
+
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+
+        # --- Color Masking ---
+        # Red Masks (Red wraps around 0/180 in HSV)
+        mask_r1 = cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+        mask_r2 = cv2.inRange(hsv, np.array([170, 100, 100]), np.array([180, 255, 255]))
+        mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+        
+        # Green Mask
+        mask_green = cv2.inRange(hsv, np.array([40, 100, 100]), np.array([80, 255, 255]))
+
+        # --- VISUAL DEBUGGING INTEGRATION ---
+        # 1. Create a blank black image with the same dimensions, 3 channels (BGR)
+        height, width, _ = cv_image.shape
+        debug_img = np.zeros((height, width, 3), np.uint8)
+
+        # 2. Assign masks to appropriate channels in BGR image
+        # BGR: Index 0=Blue, 1=Green, 2=Red
+        debug_img[:, :, 1] = mask_green # Set Green channel
+        debug_img[:, :, 2] = mask_red   # Set Red channel
+
+        # 3. Publish debug image
+        try:
+            # We use "bgr8" encoding because we created a 3-channel image
+            debug_msg = self.bridge.cv2_to_imgmsg(debug_img, "bgr8")
+            self.debug_pub.publish(debug_msg)
+        except CvBridgeError as e:
+             self.get_logger().error(f"Debug Publish Error: {e}")
+        # ------------------------------------
+
+        # Check contours for logic
+        if self.check_contour(mask_red):
+            self.found_type = "Fire Hydrant (Red)"
+            self.object_found = True
+        elif self.check_contour(mask_green):
+            self.found_type = "Trash Can (Green)"
+            self.object_found = True
+        else:
+            self.object_found = False
+
+    def check_contour(self, mask):
+        # RETR_EXTERNAL is usually sufficient if we just want the outer shape
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > self.min_contour_area:
+                return True
+        return False
+
+    def control_loop(self):
+        cmd = Twist()
+
+        if self.object_found:
+            # Priority 1: Stop if target found
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            # Throttle logging so it doesn't spam the console too hard
+            self.get_logger().info(f"FOUND {self.found_type} at X={self.robot_pose['x']:.2f}", throttle_duration_sec=1.0)
+            
+        elif self.obstacle_detected:
+            # Priority 2: Avoid Obstacle
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.5 
+
+        else:
+            # Priority 3: Search
+            cmd.linear.x = 0.2
+            cmd.angular.z = 0.0
+
+        self.vel_pub.publish(cmd)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SimpleSearch()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
