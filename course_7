@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+
+import math
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, qos_profile_sensor_data, ReliabilityPolicy, DurabilityPolicy
+
+import cv2
+import numpy as np
+from cv_bridge import CvBridge, CvBridgeError
+
+from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
+from sensor_msgs.msg import Image, LaserScan
+from visualization_msgs.msg import Marker
+
+
+class AutonomousSearch(Node):
+    """
+    Single node that:
+    - explores the environment visiting a grid of absolute waypoints
+    - always selects the nearest unvisited waypoint
+    - detects red and green objects in the camera
+    - approaches them and stops at a safe distance
+    - estimates object location in the map frame using AMCL pose
+    - publishes RViz markers and keeps a list of found objects
+    """
+
+    def __init__(self):
+        super().__init__("autonomous_search_node")
+
+        # QoS settings
+        sensor_qos = qos_profile_sensor_data
+        
+        # AMCL pose usually uses TRANSIENT_LOCAL durability.
+        # We need a matching QoS profile to receive the latched message.
+        amcl_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE
+        )
+
+        # Publishers
+        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.marker_pub = self.create_publisher(Marker, "/detected_objects", 10)
+
+        # Subscribers
+        self.image_sub = self.create_subscription(
+            Image,
+            "/camera/image_raw", 
+            self.image_callback,
+            sensor_qos,
+        )
+
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            "/scan",
+            self.scan_callback,
+            sensor_qos,
+        )
+
+        self.pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            "/amcl_pose",
+            self.pose_callback,
+            amcl_qos,
+        )
+
+        # Helpers
+        self.bridge = CvBridge()
+
+        # Robot pose from AMCL
+        self.robot_pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        self.have_pose = False
+
+        # Laser info
+        self.front_distance = None
+
+        # Detection from camera
+        self.current_detection = None
+        self.img_count = 0 
+
+        # Found objects
+        self.found_objects = []
+        self.marker_id_counter = 0
+
+        # Behaviour state
+        self.state = "EXPLORE"
+        self.turn_away_counter = 0 
+        self.backup_counter = 0    
+        self.avoidance_timer = 0   
+        self.avoidance_direction = 1.0 
+
+        # Waypoint Navigation (Absolute Coordinates)
+        # Defining a grid that covers a standard area.
+        # Expanded to 4 columns x 3 rows = 12 waypoints.
+        self.unvisited_waypoints = [
+            (-3.0, -2.0), (-3.0, 0.0), (-3.0, 2.0),
+            (-1.0, -2.0), (-1.0, 0.0), (-1.0, 2.0),
+            (1.0, -2.0),  (1.0, 0.0),  (1.0, 2.0),
+            (3.0, -2.0),  (3.0, 0.0),  (3.0, 2.0)
+        ]
+        self.current_waypoint = None 
+        
+        self.waypoint_dist_tolerance = 0.5
+        self.waypoint_yaw_tolerance = 0.1
+
+        # Tuning parameters
+        self.min_contour_area = 800.0 
+
+        # HSV ranges
+        self.red_lower_1 = np.array([0, 70, 50])
+        self.red_upper_1 = np.array([10, 255, 255])
+        self.red_lower_2 = np.array([160, 70, 50])
+        self.red_upper_2 = np.array([180, 255, 255])
+
+        self.green_lower = np.array([35, 40, 40])
+        self.green_upper = np.array([85, 255, 255])
+
+        # Motion parameters
+        self.safe_forward_distance = 0.6     
+        self.safe_object_distance = 0.8      
+        self.collision_distance = 0.25       
+        self.max_linear_speed = 0.2
+        self.max_angular_speed = 0.6
+        self.center_tolerance = 0.1          
+        
+        self.get_logger().info("AutonomousSearch node started. Ready to explore map grid.")
+        
+        # Control loop timer
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+    # -------------- Callbacks --------------
+
+    def pose_callback(self, msg: PoseWithCovarianceStamped):
+        pose = msg.pose.pose
+        self.robot_pose['x'] = pose.position.x
+        self.robot_pose['y'] = pose.position.y
+
+        q = pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.robot_pose['yaw'] = math.atan2(siny_cosp, cosy_cosp)
+
+        self.have_pose = True
+
+    def scan_callback(self, msg: LaserScan):
+        ranges = msg.ranges
+        if not ranges:
+            self.front_distance = None
+            return
+
+        # Check +/- 30 degrees cone
+        front_ranges = list(ranges[0:30]) + list(ranges[330:360])
+
+        valid = [
+            r for r in front_ranges
+            if np.isfinite(r) and 0.05 < r < 10.0
+        ]
+
+        if valid:
+            self.front_distance = float(min(valid))
+        else:
+            self.front_distance = None
+
+    def image_callback(self, msg: Image):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except CvBridgeError as e:
+            self.get_logger().error(f"CV Bridge error: {e}")
+            return
+
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        height, width, _ = cv_image.shape
+
+
+        mask_r1 = cv2.inRange(hsv, self.red_lower_1, self.red_upper_1)
+        mask_r2 = cv2.inRange(hsv, self.red_lower_2, self.red_upper_2)
+        mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+        mask_green = cv2.inRange(hsv, self.green_lower, self.green_upper)
+
+        red_det = self.find_blob(mask_red, width, label="RED")
+        green_det = self.find_blob(mask_green, width, label="GREEN")
+
+        candidates = []
+        if red_det is not None:
+            candidates.append({
+                "type": "hydrant",
+                "offset": red_det["offset"],
+                "area": red_det["area"],
+            })
+        if green_det is not None:
+            candidates.append({
+                "type": "trash_can",
+                "offset": green_det["offset"],
+                "area": green_det["area"],
+            })
+
+        if not candidates:
+            self.current_detection = None
+            return
+
+        best = max(candidates, key=lambda d: d["area"])
+        self.current_detection = best
+
+        # Debug view
+        debug_mask = cv2.merge([mask_red, mask_green, np.zeros_like(mask_red)])
+        cv2.imshow("camera", cv_image)
+        cv2.imshow("masks (R G)", debug_mask)
+        cv2.waitKey(1)
+
+    # -------------- Perception helpers --------------
+
+    def find_blob(self, mask, width, label=""):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        
+        if area < self.min_contour_area:
+            return None
+        
+        M = cv2.moments(largest)
+        if M["m00"] == 0:
+            return None
+
+        cx = int(M["m10"] / M["m00"])
+        offset = (cx - width / 2.0) / (width / 2.0)
+        return {"cx": cx, "offset": offset, "area": area}
+
+    # -------------- Object localisation and markers --------------
+
+    def estimate_object_position(self, detection, dist=None):
+        if not self.have_pose:
+            self.get_logger().warn("Cannot estimate object position, no AMCL pose yet.")
+            return None, None
+
+        d = dist if dist is not None else self.safe_object_distance
+        x = self.robot_pose['x']
+        y = self.robot_pose['y']
+        yaw = self.robot_pose['yaw']
+
+        obj_x = x + d * math.cos(yaw)
+        obj_y = y + d * math.sin(yaw)
+
+        return obj_x, obj_y
+
+    def is_duplicate_object(self, obj_type, obj_x, obj_y, min_dist=0.5):
+        for existing in self.found_objects:
+            dx = existing["x"] - obj_x
+            dy = existing["y"] - obj_y
+            if math.sqrt(dx * dx + dy * dy) < min_dist and existing["type"] == obj_type:
+                return True
+        return False
+
+    def publish_marker(self, obj_type, obj_x, obj_y):
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "detected_objects"
+        marker.id = self.marker_id_counter
+        self.marker_id_counter += 1
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = obj_x
+        marker.pose.position.y = obj_y
+        marker.pose.position.z = 0.1
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.3
+        marker.scale.y = 0.3
+        marker.scale.z = 0.3
+
+        if "hydrant" in obj_type: 
+            marker.color.r = 1.0
+        else:
+            marker.color.g = 1.0
+        
+        marker.color.a = 1.0
+        self.marker_pub.publish(marker)
+
+    def handle_new_detection(self, detection):
+        found_type = detection['type']
+        obj_x, obj_y = self.estimate_object_position(detection)
+
+        if obj_x is None:
+            return
+
+        if self.is_duplicate_object(found_type, obj_x, obj_y):
+            return
+
+        self.found_objects.append(
+            {"type": found_type, "x": obj_x, "y": obj_y}
+        )
+        self.publish_marker(found_type, obj_x, obj_y)
+        self.get_logger().info(f"Stored {found_type} at ({obj_x:.2f}, {obj_y:.2f})")
+
+    # -------------- Motion and state machine --------------
+
+    def stop_robot(self):
+        twist = Twist()
+        self.cmd_pub.publish(twist)
+
+    def get_waypoint_error(self):
+        """
+        Calculates distance and yaw error to the ACTIVE current waypoint.
+        Returns (distance, yaw_error).
+        """
+        if self.have_pose and self.current_waypoint is not None:
+            goal_x, goal_y = self.current_waypoint
+            
+            dx = goal_x - self.robot_pose['x']
+            dy = goal_y - self.robot_pose['y']
+            distance = math.sqrt(dx**2 + dy**2)
+            
+            goal_yaw = math.atan2(dy, dx)
+            yaw_err = goal_yaw - self.robot_pose['yaw']
+            
+            # Normalize angle
+            while yaw_err > math.pi: yaw_err -= 2 * math.pi
+            while yaw_err < -math.pi: yaw_err += 2 * math.pi
+            
+            return distance, yaw_err
+        return None, None
+
+    def get_closest_waypoint(self):
+        """Finds the nearest unvisited waypoint to the robot"""
+        if not self.unvisited_waypoints:
+            return None
+        
+        closest_pt = None
+        min_dist = float('inf')
+        
+        for pt in self.unvisited_waypoints:
+            dx = pt[0] - self.robot_pose['x']
+            dy = pt[1] - self.robot_pose['y']
+            d = math.sqrt(dx*dx + dy*dy)
+            
+            if d < min_dist:
+                min_dist = d
+                closest_pt = pt
+        
+        return closest_pt
+
+    def control_loop(self):
+        twist = Twist()
+
+        detection = self.current_detection
+        front = self.front_distance
+
+        # GLOBAL OBSTACLE CHECK
+        if front is not None and front < self.collision_distance and self.state != "OBSTACLE_AVOIDANCE":
+            self.get_logger().warn("Too close! Switching to OBSTACLE_AVOIDANCE")
+            self.state = "OBSTACLE_AVOIDANCE"
+            self.avoidance_timer = 30 # 3 seconds
+            
+            # Turn towards waypoint to escape if one is active
+            _, yaw_err = self.get_waypoint_error()
+            if yaw_err is not None:
+                self.avoidance_direction = -1.0 if yaw_err < 0 else 1.0
+            else:
+                self.avoidance_direction = 1.0 # Default Left
+            
+        if self.state == "EXPLORE":
+            # 1. Waypoint Selection Logic (Greedy / Nearest Neighbor)
+            if self.have_pose and self.current_waypoint is None:
+                if self.unvisited_waypoints:
+                    self.current_waypoint = self.get_closest_waypoint()
+                    self.get_logger().info(f"Targeting new waypoint: {self.current_waypoint}")
+                else:
+                    self.get_logger().info("All waypoints visited. Exploration complete.")
+                    twist.linear.x = 0.0
+                    twist.angular.z = 0.0
+                    self.cmd_pub.publish(twist)
+                    return
+
+            # Decide if we should chase the object or ignore it
+            should_chase = False
+            
+            if detection is not None:
+                should_chase = True
+                if front is not None and self.have_pose:
+                    est_x, est_y = self.estimate_object_position(detection, dist=front)
+                    # Ignore if known
+                    if self.is_duplicate_object(detection['type'], est_x, est_y, min_dist=1.5):
+                        self.get_logger().info("Ignoring known object (treating as obstacle).")
+                        should_chase = False
+            
+            if should_chase:
+                self.get_logger().info(f"New object detected: {detection['type']}")
+                self.state = "TURN_TO_OBJECT"
+            else:
+                # Check for obstacles blocking the path
+                if front is not None and front < self.safe_forward_distance:
+                    self.state = "OBSTACLE_AVOIDANCE"
+                    self.avoidance_timer = 40 
+                    
+                    _, yaw_err = self.get_waypoint_error()
+                    if yaw_err is not None:
+                        self.avoidance_direction = -1.0 if yaw_err < 0 else 1.0
+                    else:
+                        self.avoidance_direction = 1.0
+                    return
+
+                # Navigate to current waypoint
+                if self.current_waypoint is not None:
+                    dist, yaw_err = self.get_waypoint_error()
+                    if dist is not None:
+                        if dist < self.waypoint_dist_tolerance:
+                            self.get_logger().info(f"Reached waypoint {self.current_waypoint}")
+                            
+                            # Remove reached waypoint from the list
+                            if self.current_waypoint in self.unvisited_waypoints:
+                                self.unvisited_waypoints.remove(self.current_waypoint)
+                            
+                            self.current_waypoint = None # Reset to trigger next selection
+                        else:
+                            if abs(yaw_err) > self.waypoint_yaw_tolerance:
+                                twist.angular.z = 0.5 if yaw_err > 0 else -0.5
+                            else:
+                                twist.linear.x = self.max_linear_speed
+                elif not self.have_pose:
+                     self.get_logger().info("Waiting for AMCL pose...")
+
+        elif self.state == "OBSTACLE_AVOIDANCE":
+            if front is not None and front < self.safe_forward_distance:
+                twist.linear.x = 0.0
+                twist.angular.z = self.avoidance_direction * self.max_angular_speed
+                self.avoidance_timer = 40 
+            else:
+                twist.linear.x = self.max_linear_speed
+                twist.angular.z = 0.0
+                self.avoidance_timer -= 1
+                
+            if self.avoidance_timer <= 0:
+                self.state = "EXPLORE"
+                self.get_logger().info("Obstacle avoided. Resuming navigation.")
+
+        elif self.state == "TURN_TO_OBJECT":
+            if detection is None:
+                self.state = "EXPLORE"
+            else:
+                offset = detection["offset"]
+                if abs(offset) < self.center_tolerance:
+                    self.state = "APPROACH_OBJECT"
+                else:
+                    twist.angular.z = -self.max_angular_speed * offset
+
+        elif self.state == "APPROACH_OBJECT":
+            if detection is None:
+                self.state = "EXPLORE"
+            else:
+                offset = detection["offset"]
+                twist.angular.z = -self.max_angular_speed * offset
+                twist.linear.x = 0.1
+
+                if front is not None and front < self.safe_object_distance:
+                    self.stop_robot()
+                    self.handle_new_detection(detection)
+                    self.current_detection = None
+                    self.state = "BACKING_UP"
+                    self.backup_counter = 15
+                    self.get_logger().info("Object handled. Backing up...")
+                    return
+
+        elif self.state == "BACKING_UP":
+            if self.backup_counter > 0:
+                twist.linear.x = -0.1
+                self.backup_counter -= 1
+            else:
+                self.state = "SPINNING_AWAY"
+                self.turn_away_counter = 30 
+                self.get_logger().info("Backing done. Spinning away...")
+
+        elif self.state == "SPINNING_AWAY":
+            if self.turn_away_counter > 0:
+                twist.angular.z = self.max_angular_speed
+                self.turn_away_counter -= 1
+            else:
+                self.state = "EXPLORE"
+                self.get_logger().info("Maneuver complete. Resuming waypoints.")
+
+        self.cmd_pub.publish(twist)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AutonomousSearch()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop_robot()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
