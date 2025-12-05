@@ -277,7 +277,7 @@ class AutonomousSearch(Node):
 
     def mark_obstacle(self, wx, wy):
         """
-        Marks a cell (and its 3x3 neighbors) as occupied in the internal map data.
+        Marks a cell (and its 5x5 neighbors) as occupied in the internal map data.
         """
         gx_c, gy_c = self.world_to_grid(wx, wy)
         
@@ -286,9 +286,10 @@ class AutonomousSearch(Node):
 
         if self.map_data is not None:
             h, w = self.map_data.shape
-            # Mark 3x3 area around the point as occupied to ensure path clearance
-            for dy in [-1, 0, 1]:
-                for dx in [-1, 0, 1]:
+            # Mark 5x5 area around the point as occupied to ensure path clearance
+            # range(-2, 3) gives -2, -1, 0, 1, 2
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
                     nx, ny = gx_c + dx, gy_c + dy
                     
                     # SAFETY: Don't mark the robot's current cell as obstacle
@@ -530,7 +531,7 @@ class AutonomousSearch(Node):
                 
                 # Switch to RECOVERY state to back up before Replanning
                 self.state = "RECOVER_FROM_OBSTACLE"
-                self.backup_counter = 20 # 2 seconds
+                self.backup_counter = 40 # 4 seconds total (2s backup, 2s spin)
                 return
 
             if dist < 0.2: # Reached local node
@@ -544,14 +545,21 @@ class AutonomousSearch(Node):
                     twist.angular.z = yaw_err * 0.5 # Proportional heading correction
 
         elif self.state == "RECOVER_FROM_OBSTACLE":
-            if self.backup_counter > 0:
-                # Blind backup if rear is clear, otherwise spin
+            # Split recovery into Backup (first half) and Spin (second half)
+            if self.backup_counter > 20:
+                # Phase 1: Blind backup if rear is clear
                 if self.rear_distance is None or self.rear_distance > 0.3:
                     twist.linear.x = -0.15 
                 else:
                     twist.angular.z = 0.5 # blocked behind, spin
-                self.backup_counter -= 1
-            else:
+            elif self.backup_counter > 0:
+                # Phase 2: Spin to break orientation lock
+                twist.linear.x = 0.0
+                twist.angular.z = 0.6
+                
+            self.backup_counter -= 1
+            
+            if self.backup_counter <= 0:
                 self.state = "PLANNING"
                 self.get_logger().info("Recovered. Replanning.")
 
