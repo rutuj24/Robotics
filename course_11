@@ -128,7 +128,7 @@ class AutonomousSearch(Node):
 
         # Motion parameters
         self.safe_object_distance = 0.8      
-        self.collision_distance = 0.25       
+        self.collision_distance = 0.35 # Slightly increased for safer avoidance
         self.max_linear_speed = 0.2
         self.max_angular_speed = 0.6
         self.center_tolerance = 0.1          
@@ -261,6 +261,22 @@ class AutonomousSearch(Node):
             if self.is_valid_cell(nx, ny):
                 neighbors.append((nx, ny))
         return neighbors
+
+    def mark_obstacle(self, wx, wy):
+        """
+        Marks a cell (and its 3x3 neighbors) as occupied in the internal map data.
+        """
+        gx_c, gy_c = self.world_to_grid(wx, wy)
+        if self.map_data is not None:
+            h, w = self.map_data.shape
+            # Mark 3x3 area around the point as occupied to ensure path clearance
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    nx, ny = gx_c + dx, gy_c + dy
+                    if 0 <= nx < w and 0 <= ny < h:
+                        self.map_data[ny, nx] = 100 # Mark as lethal obstacle
+            return True
+        return False
 
     def plan_path_a_star(self, start_world, goal_world):
         """
@@ -474,10 +490,17 @@ class AutonomousSearch(Node):
 
             # Check if dynamic obstacle is blocking path (not in map)
             if front is not None and front < self.collision_distance:
-                self.get_logger().warn("Dynamic Obstacle! Stopping.")
+                self.get_logger().warn("Dynamic Obstacle detected! Updating map and replanning.")
                 twist.linear.x = 0.0
-                # Could add replanning here logic, but for now simple wait
                 self.cmd_pub.publish(twist)
+                
+                # Calculate obstacle position (approx in front)
+                obs_x = self.robot_pose['x'] + front * math.cos(self.robot_pose['yaw'])
+                obs_y = self.robot_pose['y'] + front * math.sin(self.robot_pose['yaw'])
+                
+                # Mark as wall in internal map and replan
+                if self.mark_obstacle(obs_x, obs_y):
+                    self.state = "PLANNING"
                 return
 
             if dist < 0.2: # Reached local node
