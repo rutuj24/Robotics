@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+
+import math
+import heapq
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, qos_profile_sensor_data, ReliabilityPolicy, DurabilityPolicy
+
+import cv2
+import numpy as np
+from cv_bridge import CvBridge, CvBridgeError
+
+from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
+from sensor_msgs.msg import Image, LaserScan
+from nav_msgs.msg import OccupancyGrid
+from visualization_msgs.msg import Marker
+
+
+class AutonomousSearch(Node):
+    """
+    Single node that:
+    - subscribes to /map and plans paths using A* algorithm
+    - explores the environment visiting a grid of absolute waypoints
+    - detects red and green objects in the camera
+    - approaches them and stops at a safe distance
+    - estimates object location in the map frame using AMCL pose
+    - publishes RViz markers and keeps a list of found objects
+    """
+
+    def __init__(self):
+        super().__init__("autonomous_search_node")
+
+        # QoS settings
+        sensor_qos = qos_profile_sensor_data
+        
+        # AMCL pose usually uses TRANSIENT_LOCAL durability (Latched)
+        amcl_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE
+        )
+
+        # Map QoS: Changed BACK to TRANSIENT_LOCAL.
+        # Standard map_server latches the map. A Volatile subscriber starting late misses it.
+        map_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE
+        )
+
+        # Publishers
+        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.marker_pub = self.create_publisher(Marker, "/detected_objects", 10)
+
+        # Subscribers
+        self.image_sub = self.create_subscription(
+            Image,
+            "/camera/image_raw", 
+            self.image_callback,
+            sensor_qos,
+        )
+
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            "/scan",
+            self.scan_callback,
+            sensor_qos,
+        )
+
+        self.pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped,
+            "/amcl_pose",
+            self.pose_callback,
+            amcl_qos, # Use specific AMCL profile
+        )
+
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,
+            "/map",
+            self.map_callback,
+            map_qos # Use the new Map profile
+        )
+
+        # Helpers
+        self.bridge = CvBridge()
+
+        # Robot State
+        self.robot_pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        self.have_pose = False
+        self.map_data = None
+        self.map_info = None
+
+        # Laser info
+        self.front_distance = None
+        self.rear_distance = None # Added for safe backup
+
+        # Detection from camera
+        self.current_detection = None
+        self.img_count = 0 
+
+        # Found objects
+        self.found_objects = []
+        self.marker_id_counter = 0
+
+        # Behaviour state
+        self.state = "PLANNING" # Start by planning a path
+        self.turn_away_counter = 0 
+        self.backup_counter = 0    
+
+        # A* Path Planning Variables
+        self.current_path = [] # List of (x, y) tuples
+        self.path_index = 0
+
+        # Waypoint Navigation
+        self.unvisited_waypoints = [
+            (-3.0, -2.0), (-3.0, 0.0), (-3.0, 2.0),
+            (-1.0, -2.0), (-1.0, 0.0), (-1.0, 2.0),
+            (1.0, -2.0),  (1.0, 0.0),  (1.0, 2.0),
+            (3.0, -2.0),  (3.0, 0.0),  (3.0, 2.0)
+        ]
+        self.current_waypoint = None 
+        
+        self.waypoint_dist_tolerance = 0.4
+        self.waypoint_yaw_tolerance = 0.1
+
+        # Tuning parameters
+        self.min_contour_area = 800.0 
+
+        # HSV ranges (High Saturation/Value for Red)
+        self.red_lower_1 = np.array([0, 185, 140])
+        self.red_upper_1 = np.array([10, 255, 255])
+        self.red_lower_2 = np.array([170, 185, 140])
+        self.red_upper_2 = np.array([180, 255, 255])
+
+        self.green_lower = np.array([35, 80, 50])
+        self.green_upper = np.array([85, 255, 255])
+
+        # Motion parameters
+        self.safe_object_distance = 0.8      
+        self.collision_distance = 0.35 # Slightly increased for safer avoidance
+        self.max_linear_speed = 0.2
+        self.max_angular_speed = 0.6
+        self.center_tolerance = 0.1          
+        
+        self.get_logger().info("AutonomousSearch A* node started. Waiting for Map and Pose...")
+        
+        # Control loop timer
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+    # -------------- Callbacks --------------
+
+    def map_callback(self, msg):
+        self.map_info = msg.info
+        self.map_data = np.array(msg.data).reshape((msg.info.height, msg.info.width))
+        self.get_logger().info(f"Map received. Size: {msg.info.width}x{msg.info.height}, Res: {msg.info.resolution:.3f}")
+
+    def pose_callback(self, msg: PoseWithCovarianceStamped):
+        pose = msg.pose.pose
+        self.robot_pose['x'] = pose.position.x
+        self.robot_pose['y'] = pose.position.y
+
+        q = pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.robot_pose['yaw'] = math.atan2(siny_cosp, cosy_cosp)
+
+        self.have_pose = True
+
+    def scan_callback(self, msg: LaserScan):
+        ranges = msg.ranges
+        if not ranges:
+            self.front_distance = None
+            self.rear_distance = None
+            return
+        
+        # Front: Check +/- 30 degrees cone
+        front_ranges = list(ranges[0:30]) + list(ranges[330:360])
+        valid_front = [r for r in front_ranges if np.isfinite(r) and 0.05 < r < 10.0]
+        if valid_front:
+            self.front_distance = float(min(valid_front))
+        else:
+            self.front_distance = None
+
+        # Rear: Check +/- 30 degrees cone around 180 (indices 150-210)
+        # Assuming 360 degree lidar
+        if len(ranges) >= 360:
+            rear_ranges = list(ranges[150:210])
+            valid_rear = [r for r in rear_ranges if np.isfinite(r) and 0.05 < r < 10.0]
+            if valid_rear:
+                self.rear_distance = float(min(valid_rear))
+            else:
+                self.rear_distance = None
+
+    def image_callback(self, msg: Image):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except CvBridgeError as e:
+            self.get_logger().error(f"CV Bridge error: {e}")
+            return
+
+        hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        height, width, _ = cv_image.shape
+
+        mask_r1 = cv2.inRange(hsv, self.red_lower_1, self.red_upper_1)
+        mask_r2 = cv2.inRange(hsv, self.red_lower_2, self.red_upper_2)
+        mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+        mask_green = cv2.inRange(hsv, self.green_lower, self.green_upper)
+
+        red_det = self.find_blob(mask_red, width, label="RED")
+        green_det = self.find_blob(mask_green, width, label="GREEN")
+
+        candidates = []
+        if red_det is not None:
+            candidates.append({"type": "hydrant", "offset": red_det["offset"], "area": red_det["area"]})
+        if green_det is not None:
+            candidates.append({"type": "trash_can", "offset": green_det["offset"], "area": green_det["area"]})
+
+        if not candidates:
+            self.current_detection = None
+            return
+
+        best = max(candidates, key=lambda d: d["area"])
+        self.current_detection = best
+
+        # Debug view
+        debug_mask = cv2.merge([mask_red, mask_green, np.zeros_like(mask_red)])
+        cv2.imshow("camera", cv_image)
+        cv2.imshow("masks (R G)", debug_mask)
+        cv2.waitKey(1)
+
+    # -------------- Perception helpers --------------
+
+    def find_blob(self, mask, width, label=""):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: return None
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        if area < self.min_contour_area: return None
+        M = cv2.moments(largest)
+        if M["m00"] == 0: return None
+        cx = int(M["m10"] / M["m00"])
+        offset = (cx - width / 2.0) / (width / 2.0)
+        return {"cx": cx, "offset": offset, "area": area}
+
+    # -------------- A* Path Planning --------------
+
+    def world_to_grid(self, wx, wy):
+        if self.map_info is None: return None
+        origin_x = self.map_info.origin.position.x
+        origin_y = self.map_info.origin.position.y
+        res = self.map_info.resolution
+        gx = int((wx - origin_x) / res)
+        gy = int((wy - origin_y) / res)
+        return (gx, gy)
+
+    def grid_to_world(self, gx, gy):
+        if self.map_info is None: return None
+        origin_x = self.map_info.origin.position.x
+        origin_y = self.map_info.origin.position.y
+        res = self.map_info.resolution
+        wx = (gx * res) + origin_x + (res / 2.0) # Center of cell
+        wy = (gy * res) + origin_y + (res / 2.0)
+        return (wx, wy)
+
+    def is_valid_cell(self, gx, gy):
+        if self.map_data is None: return False
+        h, w = self.map_data.shape
+        
+        # Check bounds
+        if gx < 0 or gx >= w or gy < 0 or gy >= h:
+            return False
+
+        # SAFETY MARGIN (Inflation)
+        # Check the center cell AND a margin around it to account for robot radius.
+        # A margin of 4 cells approx 20cm at 0.05m resolution.
+        # INCREASED to 6 (approx 30cm) to prevent corner cutting collisions
+        margin = 6
+        
+        # Optimization: Check center first to fail fast
+        val = self.map_data[gy, gx]
+        if val == -1 or val >= 50: return False
+
+        # Check neighbors
+        for dy in range(-margin, margin + 1):
+            for dx in range(-margin, margin + 1):
+                nx, ny = gx + dx, gy + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    v = self.map_data[ny, nx]
+                    # If any cell in the robot's footprint is a wall/unknown, this spot is invalid
+                    if v == -1 or v >= 50:
+                        return False
+        return True
+
+    def get_neighbors(self, node):
+        (gx, gy) = node
+        # 4-connected grid
+        moves = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+        neighbors = []
+        for dx, dy in moves:
+            nx, ny = gx + dx, gy + dy
+            if self.is_valid_cell(nx, ny):
+                neighbors.append((nx, ny))
+        return neighbors
+
+    def find_nearest_valid(self, gx, gy, max_radius=10):
+        """
+        BFS to find the nearest valid grid cell if current one is invalid.
+        """
+        if self.is_valid_cell(gx, gy):
+            return (gx, gy)
+            
+        queue = [(gx, gy)]
+        visited = set([(gx, gy)])
+        
+        while queue:
+            cx, cy = queue.pop(0)
+            
+            # If valid, return it
+            if self.is_valid_cell(cx, cy):
+                return (cx, cy)
+            
+            # Limit search radius
+            if abs(cx - gx) > max_radius or abs(cy - gy) > max_radius:
+                continue
+
+            # Check neighbors
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = cx + dx, cy + dy
+                if (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny))
+                    
+        return None # Could not find valid cell nearby
+
+    def mark_obstacle(self, wx, wy):
+        """
+        Marks a cell (and its 5x5 neighbors) as occupied in the internal map data.
+        """
+        gx_c, gy_c = self.world_to_grid(wx, wy)
+        
+        # Get robot's current grid position to avoid self-marking
+        rx, ry = self.world_to_grid(self.robot_pose['x'], self.robot_pose['y'])
+
+        if self.map_data is not None:
+            h, w = self.map_data.shape
+            # Mark 5x5 area around the point as occupied to ensure path clearance
+            # range(-2, 3) gives -2, -1, 0, 1, 2
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    nx, ny = gx_c + dx, gy_c + dy
+                    
+                    # SAFETY: Don't mark the robot's current cell as obstacle
+                    if nx == rx and ny == ry:
+                        continue
+
+                    if 0 <= nx < w and 0 <= ny < h:
+                        self.map_data[ny, nx] = 100 # Mark as lethal obstacle
+            return True
+        return False
+
+    def plan_path_a_star(self, start_world, goal_world):
+        """
+        Runs A* on the occupancy grid.
+        start_world, goal_world: (x, y) tuples
+        Returns: list of (x, y) tuples in world coordinates
+        """
+        if self.map_data is None:
+            self.get_logger().warn("No map data for planning.")
+            return None
+
+        start_grid = self.world_to_grid(*start_world)
+        goal_grid = self.world_to_grid(*goal_world)
+
+        # FIX: Snap Start/Goal to nearest valid cell if they are inside inflation/obstacle
+        if not self.is_valid_cell(*start_grid):
+            # self.get_logger().warn("Start invalid (in wall/inflation). Snapping to nearest...")
+            start_grid = self.find_nearest_valid(*start_grid)
+            
+        if not self.is_valid_cell(*goal_grid):
+            # self.get_logger().warn("Goal invalid. Snapping to nearest...")
+            goal_grid = self.find_nearest_valid(*goal_grid)
+
+        if start_grid is None or goal_grid is None:
+            self.get_logger().warn("Could not snap Start or Goal to valid cell.")
+            return None
+
+        # A* Init
+        open_set = []
+        heapq.heappush(open_set, (0, start_grid))
+        came_from = {}
+        g_score = {start_grid: 0}
+        f_score = {start_grid: math.sqrt((start_grid[0]-goal_grid[0])**2 + (start_grid[1]-goal_grid[1])**2)}
+
+        # To limit computation time, we can cap iterations
+        iterations = 0
+        max_iterations = 20000 
+
+        while open_set:
+            iterations += 1
+            if iterations > max_iterations:
+                self.get_logger().warn("A* timed out (too many iterations)")
+                return None
+
+            current = heapq.heappop(open_set)[1]
+
+            if current == goal_grid:
+                # Reconstruct path
+                path = []
+                while current in came_from:
+                    path.append(self.grid_to_world(*current))
+                    current = came_from[current]
+                # path.append(self.grid_to_world(*start_grid)) # Optional: include start
+                path.reverse()
+                # Downsample path to avoid too many waypoints
+                # Changed from ::5 to ::2 to ensure robot follows curves closely and doesn't cut corners into walls
+                simplified_path = path[::2]
+                if path[-1] not in simplified_path:
+                    simplified_path.append(path[-1])
+                return simplified_path
+
+            for neighbor in self.get_neighbors(current):
+                # Distance between neighbors is 1 (grid units)
+                tentative_g = g_score[current] + 1
+                
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    # Heuristic: Euclidean
+                    h = math.sqrt((neighbor[0]-goal_grid[0])**2 + (neighbor[1]-goal_grid[1])**2)
+                    f_score[neighbor] = tentative_g + h
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+        self.get_logger().warn("No path found by A*")
+        return None
+
+    # -------------- Object localisation and markers --------------
+
+    def estimate_object_position(self, detection, dist=None):
+        if not self.have_pose: return None, None
+        d = dist if dist is not None else self.safe_object_distance
+        x = self.robot_pose['x']
+        y = self.robot_pose['y']
+        yaw = self.robot_pose['yaw']
+        obj_x = x + d * math.cos(yaw)
+        obj_y = y + d * math.sin(yaw)
+        return obj_x, obj_y
+
+    def is_duplicate_object(self, obj_type, obj_x, obj_y, min_dist=0.5):
+        for existing in self.found_objects:
+            dx = existing["x"] - obj_x
+            dy = existing["y"] - obj_y
+            if math.sqrt(dx * dx + dy * dy) < min_dist and existing["type"] == obj_type:
+                return True
+        return False
+
+    def publish_marker(self, obj_type, obj_x, obj_y):
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "detected_objects"
+        marker.id = self.marker_id_counter
+        self.marker_id_counter += 1
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = obj_x
+        marker.pose.position.y = obj_y
+        marker.pose.position.z = 0.1
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.3
+        marker.scale.y = 0.3
+        marker.scale.z = 0.3
+        if "hydrant" in obj_type: marker.color.r = 1.0
+        else: marker.color.g = 1.0
+        marker.color.a = 1.0
+        self.marker_pub.publish(marker)
+
+    def handle_new_detection(self, detection):
+        found_type = detection['type']
+        obj_x, obj_y = self.estimate_object_position(detection)
+        if obj_x is None: return
+        if self.is_duplicate_object(found_type, obj_x, obj_y): return
+        self.found_objects.append({"type": found_type, "x": obj_x, "y": obj_y})
+        self.publish_marker(found_type, obj_x, obj_y)
+        
+        # Mark the detected object as an obstacle in the internal map
+        # This allows future A* planning to avoid it
+        self.mark_obstacle(obj_x, obj_y)
+        
+        self.get_logger().info(f"Stored {found_type} at ({obj_x:.2f}, {obj_y:.2f}) and marked as obstacle.")
+
+    # -------------- Motion and state machine --------------
+
+    def stop_robot(self):
+        twist = Twist()
+        self.cmd_pub.publish(twist)
+
+    def get_dist_yaw_to_target(self, target_x, target_y):
+        dx = target_x - self.robot_pose['x']
+        dy = target_y - self.robot_pose['y']
+        distance = math.sqrt(dx**2 + dy**2)
+        goal_yaw = math.atan2(dy, dx)
+        yaw_err = goal_yaw - self.robot_pose['yaw']
+        while yaw_err > math.pi: yaw_err -= 2 * math.pi
+        while yaw_err < -math.pi: yaw_err += 2 * math.pi
+        return distance, yaw_err
+
+    def get_sorted_waypoints(self):
+        """Returns list of waypoints sorted by distance to robot"""
+        if not self.unvisited_waypoints: return []
+        
+        def dist_sq(pt):
+            dx = pt[0] - self.robot_pose['x']
+            dy = pt[1] - self.robot_pose['y']
+            return dx*dx + dy*dy
+            
+        return sorted(self.unvisited_waypoints, key=dist_sq)
+
+    def control_loop(self):
+        twist = Twist()
+        detection = self.current_detection
+        front = self.front_distance
+
+        # --- High Priority: Object Tracking ---
+        if self.state not in ["TURN_TO_OBJECT", "APPROACH_OBJECT", "BACKING_UP", "SPINNING_AWAY", "RECOVER_FROM_OBSTACLE"]:
+            # Check if we should interrupt planning/moving to chase an object
+            should_chase = False
+            if detection is not None:
+                should_chase = True
+                if front is not None and self.have_pose:
+                    est_x, est_y = self.estimate_object_position(detection, dist=front)
+                    if self.is_duplicate_object(detection['type'], est_x, est_y, min_dist=1.5):
+                        should_chase = False
+            
+            if should_chase:
+                self.get_logger().info(f"Interrupted by Object: {detection['type']}")
+                self.state = "TURN_TO_OBJECT"
+                self.stop_robot()
+                return
+
+        # --- State Machine ---
+        
+        if self.state == "PLANNING":
+            if not self.have_pose or self.map_data is None:
+                if self.img_count % 20 == 0:
+                    self.get_logger().info("Waiting for Pose/Map to plan...")
+                return
+
+            if self.unvisited_waypoints:
+                # Get all targets sorted by distance
+                sorted_targets = self.get_sorted_waypoints()
+                path_found = False
+                
+                # Iterate through targets until one is reachable
+                for target in sorted_targets:
+                    start_node = (self.robot_pose['x'], self.robot_pose['y'])
+                    path = self.plan_path_a_star(start_node, target)
+                    
+                    if path:
+                        self.current_waypoint = target
+                        self.current_path = path
+                        self.path_index = 0
+                        self.state = "FOLLOW_PATH"
+                        self.get_logger().info(f"Planned path to {target} with {len(path)} nodes.")
+                        path_found = True
+                        break # Stop looking, we found a plan
+                    else:
+                        # Log but DO NOT remove. Just try the next one.
+                        # self.get_logger().warn(f"Could not plan to {target}. Trying next...")
+                        pass
+                
+                if not path_found:
+                    self.get_logger().warn("STUCK: Could not plan to ANY unvisited waypoint. Retrying...")
+                    # Optional: blind backup to unstuck?
+            else:
+                self.get_logger().info("Exploration Complete!")
+                self.stop_robot()
+
+        elif self.state == "FOLLOW_PATH":
+            if self.path_index >= len(self.current_path):
+                # Path finished, check if we reached the actual waypoint
+                self.get_logger().info("Path segment complete.")
+                if self.current_waypoint in self.unvisited_waypoints:
+                    self.unvisited_waypoints.remove(self.current_waypoint)
+                self.state = "PLANNING"
+                return
+
+            # Get next local target from path
+            target_x, target_y = self.current_path[self.path_index]
+            dist, yaw_err = self.get_dist_yaw_to_target(target_x, target_y)
+
+            # Check if dynamic obstacle is blocking path (not in map)
+            if front is not None and front < self.collision_distance:
+                self.get_logger().warn("Dynamic Obstacle detected! Updating map and RECOVERING.")
+                twist.linear.x = 0.0
+                self.cmd_pub.publish(twist)
+                
+                # Calculate obstacle position (approx in front)
+                obs_x = self.robot_pose['x'] + front * math.cos(self.robot_pose['yaw'])
+                obs_y = self.robot_pose['y'] + front * math.sin(self.robot_pose['yaw'])
+                
+                # Mark as wall in internal map
+                self.mark_obstacle(obs_x, obs_y)
+                
+                # Switch to RECOVERY state to back up before Replanning
+                self.state = "RECOVER_FROM_OBSTACLE"
+                self.backup_counter = 40 # 4 seconds total (2s backup, 2s spin)
+                return
+
+            if dist < 0.2: # Reached local node
+                self.path_index += 1
+            else:
+                # Move to local node
+                if abs(yaw_err) > 0.2:
+                    twist.angular.z = 0.5 if yaw_err > 0 else -0.5
+                else:
+                    twist.linear.x = self.max_linear_speed
+                    twist.angular.z = yaw_err * 0.5 # Proportional heading correction
+
+        elif self.state == "RECOVER_FROM_OBSTACLE":
+            # Split recovery into Backup (first half) and Spin (second half)
+            if self.backup_counter > 20:
+                # Phase 1: Blind backup if rear is clear
+                if self.rear_distance is None or self.rear_distance > 0.3:
+                    twist.linear.x = -0.15 
+                else:
+                    twist.angular.z = 0.5 # blocked behind, spin
+            elif self.backup_counter > 0:
+                # Phase 2: Spin to break orientation lock
+                twist.linear.x = 0.0
+                twist.angular.z = 0.6
+                
+            self.backup_counter -= 1
+            
+            if self.backup_counter <= 0:
+                self.state = "PLANNING"
+                self.get_logger().info("Recovered. Replanning.")
+
+        elif self.state == "TURN_TO_OBJECT":
+            if detection is None:
+                self.state = "PLANNING" # Go back to planning if lost
+            else:
+                offset = detection["offset"]
+                if abs(offset) < self.center_tolerance:
+                    self.state = "APPROACH_OBJECT"
+                else:
+                    twist.angular.z = -self.max_angular_speed * offset
+
+        elif self.state == "APPROACH_OBJECT":
+            if detection is None:
+                self.state = "PLANNING"
+            else:
+                offset = detection["offset"]
+                twist.angular.z = -self.max_angular_speed * offset
+                twist.linear.x = 0.1
+                if front is not None and front < self.safe_object_distance:
+                    self.stop_robot()
+                    self.handle_new_detection(detection)
+                    self.current_detection = None
+                    self.state = "BACKING_UP"
+                    self.backup_counter = 15
+
+        elif self.state == "BACKING_UP":
+            if self.backup_counter > 0:
+                twist.linear.x = -0.1
+                self.backup_counter -= 1
+            else:
+                self.state = "SPINNING_AWAY"
+                self.turn_away_counter = 30 
+
+        elif self.state == "SPINNING_AWAY":
+            if self.turn_away_counter > 0:
+                twist.angular.z = self.max_angular_speed
+                self.turn_away_counter -= 1
+            else:
+                self.state = "PLANNING" # Re-evaluate next best point
+                self.get_logger().info("Resuming Mission.")
+
+        self.cmd_pub.publish(twist)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AutonomousSearch()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop_robot()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
