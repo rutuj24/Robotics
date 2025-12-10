@@ -30,14 +30,13 @@ class AutonomousSearch(Node):
     - Chooses waypoints and sends them to Nav2
     - Interrupts Nav2 when a new object (hydrant/trash can) is detected
     - Manually turns & approaches the object, tags it, then resumes Nav2
-    - Handles getting stuck by generating intermediate "stepping stone" waypoints
     """
 
     def __init__(self):
         super().__init__("autonomous_search_node")
 
         # ---- Parameters ----
-        self.declare_parameter("camera_topic", "/camera_depth/image_raw")
+        self.declare_parameter("camera_topic", "/camera/image_raw")
         camera_topic = self.get_parameter("camera_topic").get_parameter_value().string_value
 
         # QoS for sensors and AMCL
@@ -118,6 +117,7 @@ class AutonomousSearch(Node):
         
         # Track skipped waypoints to retry later
         self.temporarily_skipped = set()
+        self.global_retry_triggered = False # Ensure we only retry skipped list once
 
         # ---- Waypoints ----
         self.unvisited_waypoints = []
@@ -145,8 +145,6 @@ class AutonomousSearch(Node):
         self.green_upper_1 = np.array([85, 255, 255])
         self.green_lower_2 = np.array([35, 20, 20])
         self.green_upper_2 = np.array([85, 255, 255])
-        self.green_lower_3 = np.array([0, 0, 0])
-        self.green_upper_3 = np.array([180, 60, 50])
 
         # ---- Motion tuning ----
         self.safe_object_distance = 0.8
@@ -184,7 +182,7 @@ class AutonomousSearch(Node):
             self.front_distance = None
             return
 
-        front_ranges = list(ranges[0:30]) + list(ranges[330:360])
+        front_ranges = list(ranges[0:20]) + list(ranges[340:360])
         valid_front = [r for r in front_ranges if math.isfinite(r) and 0.05 < r < 10.0]
         self.front_distance = float(min(valid_front)) if valid_front else None
 
@@ -203,11 +201,10 @@ class AutonomousSearch(Node):
         mask_r2 = cv2.inRange(hsv, self.red_lower_2, self.red_upper_2)
         mask_red = cv2.bitwise_or(mask_r1, mask_r2)
 
-        # Green mask
+        # Green mask - Simplified to one wide range for robustness
         mask_g1 = cv2.inRange(hsv, self.green_lower_1, self.green_upper_1)
         mask_g2 = cv2.inRange(hsv, self.green_lower_2, self.green_upper_2)
-        mask_g3 = cv2.inRange(hsv, self.green_lower_2, self.green_upper_2)
-        mask_green = cv2.bitwise_or(mask_g1, mask_g2, mask_g3)
+        mask_green = cv2.bitwise_or(mask_g1, mask_g2)
 
         red_det = self.find_blob(mask_red, width)
         green_det = self.find_blob(mask_green, width)
@@ -300,9 +297,9 @@ class AutonomousSearch(Node):
                 return
 
         # 2. Stuck Detection
-        # If moved less than 5cm in 15 seconds, assume stuck
+        # If moved less than 5cm in 15 seconds, assume stuck at corner
         if (self.last_dist_remaining - dist) < 0.05:
-            if (current_time - self.stuck_timer) > 7.0:
+            if (current_time - self.stuck_timer) > 15.0:
                 if self.navigation_active and self.cancel_reason == "NONE":
                     self.get_logger().warn("Stuck at corner/obstacle (>15s). Skipping waypoint.")
                     self.cancel_reason = "STUCK"
@@ -339,12 +336,14 @@ class AutonomousSearch(Node):
                 self.unvisited_waypoints.remove(self.current_waypoint)
             # Success! Clear skipped list so we can retry those points
             self.temporarily_skipped.clear()
+            self.global_retry_triggered = False # Reset retry flag on success
             
         elif status == GoalStatus.STATUS_CANCELED:
             if self.cancel_reason == "REACHED":
                 if self.current_waypoint in self.unvisited_waypoints:
                     self.unvisited_waypoints.remove(self.current_waypoint)
                 self.temporarily_skipped.clear()
+                self.global_retry_triggered = False # Reset retry flag on success
             elif self.cancel_reason == "STUCK":
                 self.get_logger().warn(f"Goal Stuck. Skipping {self.current_waypoint} for now.")
                 if self.current_waypoint:
@@ -359,12 +358,14 @@ class AutonomousSearch(Node):
 
         self.current_waypoint = None
         
+        # Only go to IDLE if we aren't busy handling an object
         if self.state == "NAVIGATING":
             self.state = "IDLE"
 
     def cancel_nav_goal(self):
         """Cancel Nav2 goal to switch to manual control."""
         if self.goal_handle is not None and self.navigation_active:
+            # self.get_logger().warn("Cancelling Nav2 goal.")
             self.goal_handle.cancel_goal_async()
         self.goal_handle = None
         self.navigation_active = False
@@ -375,25 +376,15 @@ class AutonomousSearch(Node):
     def estimate_object_position(self, detection, dist=None):
         if not self.have_pose:
             return None, None
-        
-        # 1. Distance + Radius
-        surface_dist = dist if dist is not None else self.safe_object_distance
-        object_radius = 0.15 
-        d = surface_dist + object_radius
-        
-        # 2. Angle Correction
-        fov = 1.08
-        angle_correction = -detection["offset"] * (fov / 2.0)
-        
-        yaw = self.robot_pose['yaw'] + angle_correction
-        x = self.robot_pose['x']
-        y = self.robot_pose['y']
-        
+        d = dist if dist is not None else self.safe_object_distance
+        x = self.robot_pose["x"]
+        y = self.robot_pose["y"]
+        yaw = self.robot_pose["yaw"]
         obj_x = x + d * math.cos(yaw)
         obj_y = y + d * math.sin(yaw)
         return obj_x, obj_y
 
-    def is_duplicate_object(self, obj_type, obj_x, obj_y, min_dist=1.0):
+    def is_duplicate_object(self, obj_type, obj_x, obj_y, min_dist=0.5):
         for existing in self.found_objects:
             if existing["type"] != obj_type:
                 continue
@@ -510,41 +501,16 @@ class AutonomousSearch(Node):
         # Filter out temporarily skipped waypoints
         candidates = [pt for pt in self.unvisited_waypoints if pt not in self.temporarily_skipped]
         
-        # If all candidates are skipped (stuck loop), try to generate intermediate points
+        # If all candidates are skipped (stuck loop), retry skipped list ONLY ONCE
         if not candidates:
-            self.get_logger().warn("All candidates skipped. Attempting to generate path to closest skipped target.")
-            
-            # 1. Find the closest target in the skipped list
-            closest_skipped = None
-            min_skipped_dist = float('inf')
-            
-            for pt in self.temporarily_skipped:
-                d = math.hypot(pt[0] - self.robot_pose["x"], pt[1] - self.robot_pose["y"])
-                if d < min_skipped_dist:
-                    min_skipped_dist = d
-                    closest_skipped = pt
-            
-            if closest_skipped:
-                # 2. Generate intermediate points (Stepping Stones)
-                rx, ry = self.robot_pose["x"], self.robot_pose["y"]
-                tx, ty = closest_skipped
-                
-                # Vector to target
-                vx, vy = tx - rx, ty - ry
-                
-                # Add 10 intermediate points (stepping stones)
-                num_points = 10
-                self.get_logger().info(f"Generating {num_points} stepping stones to {closest_skipped}")
-                
-                for i in range(1, num_points + 1):
-                    fraction = i / (num_points + 1)
-                    px = rx + vx * fraction
-                    py = ry + vy * fraction
-                    self.unvisited_waypoints.append((px, py))
-
-            # 3. Clear skipped list to retry everything including new points
-            self.temporarily_skipped.clear()
-            candidates = self.unvisited_waypoints
+            if not self.global_retry_triggered:
+                self.get_logger().warn("All candidates skipped. Clearing skip list for ONE retry.")
+                self.temporarily_skipped.clear()
+                self.global_retry_triggered = True
+                candidates = self.unvisited_waypoints
+            else:
+                self.get_logger().error("All candidates skipped again. Aborting exploration.")
+                return None
 
         best = None
         best_d = float("inf")
@@ -598,6 +564,12 @@ class AutonomousSearch(Node):
 
             if self.unvisited_waypoints:
                 target = self.get_closest_waypoint()
+                
+                if target is None:
+                    self.get_logger().error("Exploration aborted: Remaining waypoints unreachable.")
+                    self.stop_robot()
+                    return
+
                 self.current_waypoint = target
                 ok = self.send_nav_goal(target[0], target[1])
                 if ok:
@@ -607,11 +579,15 @@ class AutonomousSearch(Node):
                 self.stop_robot()
 
         elif self.state == "NAVIGATING":
+            # Just wait. 
+            # Nav2 is in control. feedback_callback handles tolerance check.
+            # result_callback handles state change to IDLE.
             pass
 
         elif self.state == "TURN_TO_OBJECT":
             twist = Twist()
             if detection is None:
+                # Lost object, go back to Nav2
                 self.state = "IDLE"
             else:
                 offset = detection["offset"]
@@ -624,11 +600,13 @@ class AutonomousSearch(Node):
         elif self.state == "APPROACH_OBJECT":
             twist = Twist()
             if detection is None:
+                # Lost object, return to Nav2
                 self.state = "IDLE"
             else:
                 offset = detection["offset"]
                 twist.angular.z = -self.max_angular_speed * offset
-                twist.linear.x = 0.4
+                twist.linear.x = 0.1
+                # Stop at safe distance based on LIDAR
                 if front is not None and front < self.safe_object_distance:
                     self.stop_robot()
                     self.handle_new_detection(detection)
@@ -640,7 +618,7 @@ class AutonomousSearch(Node):
         elif self.state == "BACKING_UP":
             twist = Twist()
             if self.backup_counter > 0:
-                twist.linear.x = -0.2
+                twist.linear.x = -0.1
                 self.backup_counter -= 1
             else:
                 self.state = "SPINNING_AWAY"
@@ -666,6 +644,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # Avoid publishing during shutdown to prevent RCLError
         node.destroy_node()
         cv2.destroyAllWindows()
         rclpy.shutdown()
