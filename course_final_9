@@ -130,13 +130,17 @@ class AutonomousSearch(Node):
         # ---- Vision tuning ----
         self.min_contour_area = 800.0
 
-        self.red_lower_1 = np.array([0, 185, 140])
-        self.red_upper_1 = np.array([10, 255, 255])
-        self.red_lower_2 = np.array([170, 185, 140])
+        self.red_lower_1 = np.array([0, 90, 120])
+        self.red_upper_1 = np.array([5, 255, 255])
+        self.red_lower_2 = np.array([170, 90, 120])
         self.red_upper_2 = np.array([180, 255, 255])
 
-        self.green_lower = np.array([35, 80, 50])
-        self.green_upper = np.array([85, 255, 255])
+        self.green_lower_1 = np.array([35, 40, 40])
+        self.green_upper_1 = np.array([85, 255, 255])
+        self.green_lower_2 = np.array([35, 20, 20])
+        self.green_upper_2 = np.array([85, 255, 255])
+        self.green_lower_3 = np.array([0, 0, 0])
+        self.green_upper_3 = np.array([180, 60, 50])
 
         # ---- Motion tuning ----
         self.safe_object_distance = 0.8
@@ -194,7 +198,10 @@ class AutonomousSearch(Node):
         mask_red = cv2.bitwise_or(mask_r1, mask_r2)
 
         # Green mask
-        mask_green = cv2.inRange(hsv, self.green_lower, self.green_upper)
+        mask_g1 = cv2.inRange(hsv, self.green_lower_1, self.green_upper_1)
+        mask_g2 = cv2.inRange(hsv, self.green_lower_2, self.green_upper_2)
+        mask_g3 = cv2.inRange(hsv, self.green_lower_2, self.green_upper_2)
+        mask_green = cv2.bitwise_or(mask_g1, mask_g2, mask_g3)
 
         red_det = self.find_blob(mask_red, width)
         green_det = self.find_blob(mask_green, width)
