@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 
 import math
+import time
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, qos_profile_sensor_data, ReliabilityPolicy, DurabilityPolicy
+from rclpy.action import ActionClient
+from rclpy.qos import (
+    QoSProfile,
+    qos_profile_sensor_data,
+    ReliabilityPolicy,
+    DurabilityPolicy,
+)
 
 import cv2
 import numpy as np
@@ -11,44 +18,56 @@ from cv_bridge import CvBridge, CvBridgeError
 
 from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from sensor_msgs.msg import Image, LaserScan
-from visualization_msgs.msg import Marker
+from visualization_msgs.msg import Marker, MarkerArray
+from nav2_msgs.action import NavigateToPose
+from action_msgs.msg import GoalStatus
 
 
 class AutonomousSearch(Node):
     """
     Single node that:
-    - explores the environment visiting a grid of absolute waypoints
-    - uses BUG 2 algorithm for navigation (Motion to Goal + Wall Following)
-    - detects red and green objects in the camera
-    - approaches them and stops at a safe distance
-    - estimates object location in the map frame using AMCL pose
-    - publishes RViz markers and keeps a list of found objects
+    - Uses Nav2 (NavigateToPose action) for global navigation and obstacle avoidance
+    - Chooses waypoints and sends them to Nav2
+    - Interrupts Nav2 when a new object (hydrant/trash can) is detected
+    - Manually turns & approaches the object, tags it, then resumes Nav2
     """
 
     def __init__(self):
         super().__init__("autonomous_search_node")
 
-        # QoS settings
+        # ---- Parameters ----
+        self.declare_parameter("camera_topic", "/camera/image_raw")
+        camera_topic = self.get_parameter("camera_topic").get_parameter_value().string_value
+
+        # QoS for sensors and AMCL
         sensor_qos = qos_profile_sensor_data
-        
-        # AMCL pose usually uses TRANSIENT_LOCAL durability.
-        # We need a matching QoS profile to receive the latched message.
+
         amcl_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            reliability=ReliabilityPolicy.RELIABLE
+            reliability=ReliabilityPolicy.RELIABLE,
         )
 
-        # Publishers
+        camera_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
+        # ---- Publishers ----
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.marker_pub = self.create_publisher(Marker, "/detected_objects", 10)
+        self.waypoint_marker_pub = self.create_publisher(MarkerArray, "/waypoint_markers", 10)
 
-        # Subscribers
+        # ---- Action Client for Nav2 ----
+        self._nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+
+        # ---- Subscribers ----
         self.image_sub = self.create_subscription(
             Image,
-            "/camera/image_raw", 
+            camera_topic,
             self.image_callback,
-            sensor_qos,
+            camera_qos,
         )
 
         self.scan_sub = self.create_subscription(
@@ -65,86 +84,84 @@ class AutonomousSearch(Node):
             amcl_qos,
         )
 
-        # Helpers
+        # ---- Helpers ----
         self.bridge = CvBridge()
 
-        # Robot pose from AMCL
-        self.robot_pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        # Robot pose (from AMCL)
+        self.robot_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
         self.have_pose = False
 
-        # Laser info
+        # Nav2 state
+        self.goal_handle = None
+        self.navigation_active = False
+        self.cancel_reason = "NONE" # Track if we cancelled due to Object or Arrival
+        self.last_dist_remaining = 0.0
+        self.stuck_timer = 0.0
+        self.goal_start_time = 0.0 # To ignore early false-positives
+
+        # Laser info (for final approach)
         self.front_distance = None
-        self.left_distance = None # For wall following
 
-        # Detection from camera
+        # Vision detection
         self.current_detection = None
-        self.img_count = 0 
+        self.loop_count = 0
 
-        # Found objects
+        # Found objects list
         self.found_objects = []
         self.marker_id_counter = 0
 
         # Behaviour state
-        self.state = "EXPLORE"
-        self.turn_away_counter = 0 
-        self.backup_counter = 0    
+        self.state = "IDLE"
+        self.backup_counter = 0
+        self.turn_away_counter = 0
 
-        # Bug 2 Variables
-        self.m_line_start = None # (x, y) where we started the current segment
-        self.hit_point = None    # (x, y) where we hit the obstacle
-        self.dist_to_goal_at_hit = float('inf')
-        self.wall_follow_dir = 1.0 # 1.0 for Left wall following
+        # ---- Waypoints ----
+        self.unvisited_waypoints = []
+        # Dense grid generation: X[-1.6, 5.6], Y[-3.7, 3.9] Step 2.0
+        for x in np.arange(-1.6, 5.7, 2.0):
+            for y in np.arange(-3.7, 4.0, 2.0):
+                self.unvisited_waypoints.append((float(x), float(y)))
 
-        # Waypoint Navigation (Absolute Coordinates)
-        # Defining a grid that covers a standard area.
-        # Expanded to 4 columns x 3 rows = 12 waypoints.
-        self.unvisited_waypoints = [
-            (-3.0, -2.0), (-3.0, 0.0), (-3.0, 2.0),
-            (-1.0, -2.0), (-1.0, 0.0), (-1.0, 2.0),
-            (1.0, -2.0),  (1.0, 0.0),  (1.0, 2.0),
-            (3.0, -2.0),  (3.0, 0.0),  (3.0, 2.0)
-        ]
-        self.current_waypoint = None 
-        
-        self.waypoint_dist_tolerance = 0.5
-        self.waypoint_yaw_tolerance = 0.1
+        self.current_waypoint = None
 
-        # Tuning parameters
-        self.min_contour_area = 800.0 
+        # ---- Vision tuning ----
+        self.min_contour_area = 800.0
 
-        # HSV ranges
-        self.red_lower_1 = np.array([0, 70, 50])
+        self.red_lower_1 = np.array([0, 185, 140])
         self.red_upper_1 = np.array([10, 255, 255])
-        self.red_lower_2 = np.array([160, 70, 50])
+        self.red_lower_2 = np.array([170, 185, 140])
         self.red_upper_2 = np.array([180, 255, 255])
 
-        self.green_lower = np.array([35, 40, 40])
+        self.green_lower = np.array([35, 80, 50])
         self.green_upper = np.array([85, 255, 255])
 
-        # Motion parameters
-        self.safe_forward_distance = 0.6     
-        self.safe_object_distance = 0.8      
-        self.collision_distance = 0.25       
+        # ---- Motion tuning ----
+        self.safe_object_distance = 0.8
         self.max_linear_speed = 0.2
-        self.max_angular_speed = 0.6
-        self.center_tolerance = 0.1          
+        self.max_angular_speed = 0.5
+        self.center_tolerance = 0.1
         
-        self.get_logger().info("AutonomousSearch node started. Ready to explore map grid with Bug 2.")
-        
-        # Control loop timer
+        # Tolerance to prevent sticking at waypoints (0.3 is usually safe)
+        self.waypoint_dist_tolerance = 0.3
+
+        self.get_logger().info(
+            f"AutonomousSearch (Nav2) node started. Using camera topic: {camera_topic}"
+        )
+
+        # Main control loop
         self.timer = self.create_timer(0.1, self.control_loop)
 
-    # -------------- Callbacks --------------
+    # ---------------- Callbacks ----------------
 
     def pose_callback(self, msg: PoseWithCovarianceStamped):
         pose = msg.pose.pose
-        self.robot_pose['x'] = pose.position.x
-        self.robot_pose['y'] = pose.position.y
+        self.robot_pose["x"] = pose.position.x
+        self.robot_pose["y"] = pose.position.y
 
         q = pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.robot_pose['yaw'] = math.atan2(siny_cosp, cosy_cosp)
+        self.robot_pose["yaw"] = math.atan2(siny_cosp, cosy_cosp)
 
         self.have_pose = True
 
@@ -152,24 +169,11 @@ class AutonomousSearch(Node):
         ranges = msg.ranges
         if not ranges:
             self.front_distance = None
-            self.left_distance = None
             return
 
-        # Front: Check +/- 30 degrees cone
         front_ranges = list(ranges[0:30]) + list(ranges[330:360])
-        valid_front = [r for r in front_ranges if np.isfinite(r) and 0.05 < r < 10.0]
-        if valid_front:
-            self.front_distance = float(min(valid_front))
-        else:
-            self.front_distance = None
-
-        # Left: Check 60 to 100 degrees (approx left side)
-        left_ranges = list(ranges[60:100])
-        valid_left = [r for r in left_ranges if np.isfinite(r) and 0.05 < r < 10.0]
-        if valid_left:
-            self.left_distance = float(min(valid_left))
-        else:
-            self.left_distance = None
+        valid_front = [r for r in front_ranges if math.isfinite(r) and 0.05 < r < 10.0]
+        self.front_distance = float(min(valid_front)) if valid_front else None
 
     def image_callback(self, msg: Image):
         try:
@@ -181,28 +185,26 @@ class AutonomousSearch(Node):
         hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
         height, width, _ = cv_image.shape
 
-
+        # Red mask
         mask_r1 = cv2.inRange(hsv, self.red_lower_1, self.red_upper_1)
         mask_r2 = cv2.inRange(hsv, self.red_lower_2, self.red_upper_2)
         mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+
+        # Green mask
         mask_green = cv2.inRange(hsv, self.green_lower, self.green_upper)
 
-        red_det = self.find_blob(mask_red, width, label="RED")
-        green_det = self.find_blob(mask_green, width, label="GREEN")
+        red_det = self.find_blob(mask_red, width)
+        green_det = self.find_blob(mask_green, width)
 
         candidates = []
         if red_det is not None:
-            candidates.append({
-                "type": "hydrant",
-                "offset": red_det["offset"],
-                "area": red_det["area"],
-            })
+            candidates.append(
+                {"type": "hydrant", "offset": red_det["offset"], "area": red_det["area"]}
+            )
         if green_det is not None:
-            candidates.append({
-                "type": "trash_can",
-                "offset": green_det["offset"],
-                "area": green_det["area"],
-            })
+            candidates.append(
+                {"type": "trash_can", "offset": green_det["offset"], "area": green_det["area"]}
+            )
 
         if not candidates:
             self.current_detection = None
@@ -211,55 +213,178 @@ class AutonomousSearch(Node):
         best = max(candidates, key=lambda d: d["area"])
         self.current_detection = best
 
-        # Debug view
-        debug_mask = cv2.merge([mask_red, mask_green, np.zeros_like(mask_red)])
-        cv2.imshow("camera", cv_image)
-        cv2.imshow("masks (R G)", debug_mask)
-        cv2.waitKey(1)
-
-    # -------------- Perception helpers --------------
-
-    def find_blob(self, mask, width, label=""):
+    def find_blob(self, mask, width):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             return None
-
         largest = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(largest)
-        
         if area < self.min_contour_area:
             return None
-        
         M = cv2.moments(largest)
         if M["m00"] == 0:
             return None
-
         cx = int(M["m10"] / M["m00"])
         offset = (cx - width / 2.0) / (width / 2.0)
         return {"cx": cx, "offset": offset, "area": area}
 
-    # -------------- Object localisation and markers --------------
+    # ---------------- Nav2 helpers ----------------
+
+    def send_nav_goal(self, x, y):
+        """Send a NavigateToPose goal to Nav2."""
+        if not self._nav_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn("Nav2 Action Server not available yet.")
+            return False
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = "map"
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = float(x)
+        goal_msg.pose.pose.position.y = float(y)
+        goal_msg.pose.pose.orientation.w = 1.0
+
+        self.get_logger().info(f"Sending Nav2 goal: ({x:.2f}, {y:.2f})")
+        
+        # Reset state trackers
+        self.cancel_reason = "NONE"
+        self.last_dist_remaining = float('inf')
+        self.stuck_timer = time.time()
+        self.goal_start_time = time.time()
+
+        send_future = self._nav_client.send_goal_async(
+            goal_msg, 
+            feedback_callback=self.feedback_callback
+        )
+        send_future.add_done_callback(self.goal_response_callback)
+        return True
+
+    def feedback_callback(self, feedback_msg):
+        """Monitors distance to goal and cancels early if close enough or stuck"""
+        dist = feedback_msg.feedback.distance_remaining
+        current_time = time.time()
+        
+        # WARMUP CHECK:
+        # Ignore checks for first 2.0 seconds to allow path planner to initialize.
+        # This prevents "0.0" distance glitches from instantly completing the goal.
+        if (current_time - self.goal_start_time) < 2.0:
+            return
+
+        # Sanity check for 0.0 (Nav2 sometimes reports 0 before calculating path)
+        if dist == 0.0:
+            return
+
+        # 1. Early Exit: If we are close enough, stop Nav2 and move to next point
+        if dist < self.waypoint_dist_tolerance:
+            if self.navigation_active and self.cancel_reason == "NONE":
+                self.get_logger().info(f"Waypoint reached (Tolerance {dist:.2f}m). Moving to next.")
+                self.cancel_reason = "REACHED"
+                self.cancel_nav_goal()
+                return
+
+        # 2. Stuck Detection: Check if progress stalled
+        # If moved less than 5cm in 15 seconds, assume stuck at corner
+        if (self.last_dist_remaining - dist) < 0.05:
+            if (current_time - self.stuck_timer) > 15.0:
+                if self.navigation_active and self.cancel_reason == "NONE":
+                    self.get_logger().warn("Stuck at corner/obstacle (>15s). Skipping waypoint.")
+                    self.cancel_reason = "STUCK"
+                    self.cancel_nav_goal()
+                    return
+        else:
+            # Progress made, reset timer
+            self.last_dist_remaining = dist
+            self.stuck_timer = current_time
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle or not goal_handle.accepted:
+            self.get_logger().warn("Nav2 goal rejected.")
+            self.navigation_active = False
+            self.state = "IDLE"
+            return
+
+        self.get_logger().info("Nav2 goal accepted.")
+        self.goal_handle = goal_handle
+        self.navigation_active = True
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        status = future.result().status
+        self.get_logger().info(f"Nav2 goal finished with status: {status}")
+        self.navigation_active = False
+        self.goal_handle = None
+
+        # Logic: If we cancelled because we reached the goal, remove it.
+        # If we cancelled because of an object, KEEP it (we might want to retry).
+        # If it Aborted/Succeeded normally, remove it.
+        
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            if self.current_waypoint in self.unvisited_waypoints:
+                self.unvisited_waypoints.remove(self.current_waypoint)
+        elif status == GoalStatus.STATUS_CANCELED:
+            if self.cancel_reason == "REACHED":
+                if self.current_waypoint in self.unvisited_waypoints:
+                    self.unvisited_waypoints.remove(self.current_waypoint)
+            elif self.cancel_reason == "STUCK":
+                self.get_logger().warn("Waypoint removed due to stuck condition.")
+                if self.current_waypoint in self.unvisited_waypoints:
+                    self.unvisited_waypoints.remove(self.current_waypoint)
+            else:
+                self.get_logger().info("Goal cancelled for Object. Will resume/retry later.")
+        elif status == GoalStatus.STATUS_ABORTED:
+             if self.current_waypoint in self.unvisited_waypoints:
+                self.unvisited_waypoints.remove(self.current_waypoint)
+
+        self.current_waypoint = None
+        
+        # Only go to IDLE if we aren't busy handling an object
+        if self.state == "NAVIGATING":
+            self.state = "IDLE"
+
+    def cancel_nav_goal(self):
+        """Cancel Nav2 goal to switch to manual control."""
+        if self.goal_handle is not None and self.navigation_active:
+            # self.get_logger().warn("Cancelling Nav2 goal.")
+            self.goal_handle.cancel_goal_async()
+        self.goal_handle = None
+        self.navigation_active = False
+        self.stop_robot()
+
+    # ---------------- Object localisation & markers ----------------
 
     def estimate_object_position(self, detection, dist=None):
         if not self.have_pose:
-            self.get_logger().warn("Cannot estimate object position, no AMCL pose yet.")
             return None, None
-
-        d = dist if dist is not None else self.safe_object_distance
+        
+        # 1. Distance Calculation: Lidar measures surface. Add radius to get center.
+        surface_dist = dist if dist is not None else self.safe_object_distance
+        object_radius = 0.15 # Approx 15cm radius for hydrant/trashcan
+        d = surface_dist + object_radius
+        
+        # 2. Angle Calculation
+        # Correct the robot's yaw with the angle of the object in the image
+        # Camera FOV approx 62 degrees (1.08 rad).
+        # Offset is -1 (Left) to +1 (Right). 
+        # If object is Left (neg offset), angle should be positive relative to robot.
+        fov = 1.08
+        angle_correction = -detection["offset"] * (fov / 2.0)
+        
+        yaw = self.robot_pose['yaw'] + angle_correction
         x = self.robot_pose['x']
         y = self.robot_pose['y']
-        yaw = self.robot_pose['yaw']
-
+        
         obj_x = x + d * math.cos(yaw)
         obj_y = y + d * math.sin(yaw)
-
         return obj_x, obj_y
 
-    def is_duplicate_object(self, obj_type, obj_x, obj_y, min_dist=0.5):
+    def is_duplicate_object(self, obj_type, obj_x, obj_y, min_dist=1.0):
         for existing in self.found_objects:
+            if existing["type"] != obj_type:
+                continue
             dx = existing["x"] - obj_x
             dy = existing["y"] - obj_y
-            if math.sqrt(dx * dx + dy * dy) < min_dist and existing["type"] == obj_type:
+            if math.hypot(dx, dy) < min_dist:
                 return True
         return False
 
@@ -270,6 +395,7 @@ class AutonomousSearch(Node):
         marker.ns = "detected_objects"
         marker.id = self.marker_id_counter
         self.marker_id_counter += 1
+
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
         marker.pose.position.x = obj_x
@@ -280,265 +406,208 @@ class AutonomousSearch(Node):
         marker.scale.y = 0.3
         marker.scale.z = 0.3
 
-        if "hydrant" in obj_type: 
+        if obj_type == "hydrant":
             marker.color.r = 1.0
+            marker.color.g = 0.0
         else:
+            marker.color.r = 0.0
             marker.color.g = 1.0
-        
+        marker.color.b = 0.0
         marker.color.a = 1.0
+
         self.marker_pub.publish(marker)
 
-    def handle_new_detection(self, detection):
-        found_type = detection['type']
-        obj_x, obj_y = self.estimate_object_position(detection)
+    def publish_waypoints(self):
+        marker_array = MarkerArray()
 
+        # Clear old markers
+        delete_marker = Marker()
+        delete_marker.action = Marker.DELETEALL
+        marker_array.markers.append(delete_marker)
+
+        # Current waypoint (yellow sphere)
+        if self.current_waypoint is not None:
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = "current_waypoint"
+            m.id = 0
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = self.current_waypoint[0]
+            m.pose.position.y = self.current_waypoint[1]
+            m.pose.position.z = 0.3
+            m.scale.x = 0.4
+            m.scale.y = 0.4
+            m.scale.z = 0.4
+            m.color.r = 1.0
+            m.color.g = 1.0
+            m.color.b = 0.0
+            m.color.a = 1.0
+            marker_array.markers.append(m)
+
+        # Remaining waypoints (small yellow cubes)
+        for i, wp in enumerate(self.unvisited_waypoints):
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = "unvisited_waypoints"
+            m.id = i + 1
+            m.type = Marker.CUBE
+            m.action = Marker.ADD
+            m.pose.position.x = wp[0]
+            m.pose.position.y = wp[1]
+            m.pose.position.z = 0.1
+            m.scale.x = 0.15
+            m.scale.y = 0.15
+            m.scale.z = 0.15
+            m.color.r = 1.0
+            m.color.g = 1.0
+            m.color.b = 0.0
+            m.color.a = 0.6
+            marker_array.markers.append(m)
+
+        self.waypoint_marker_pub.publish(marker_array)
+
+    def handle_new_detection(self, detection):
+        found_type = detection["type"]
+        obj_x, obj_y = self.estimate_object_position(detection, dist=self.front_distance)
         if obj_x is None:
             return
-
-        if self.is_duplicate_object(found_type, obj_x, obj_y):
+        if self.is_duplicate_object(found_type, obj_x, obj_y, min_dist=1.0):
+            self.get_logger().info(
+                f"Ignoring duplicate {found_type} near ({obj_x:.2f}, {obj_y:.2f})"
+            )
             return
-
-        self.found_objects.append(
-            {"type": found_type, "x": obj_x, "y": obj_y}
-        )
+        self.found_objects.append({"type": found_type, "x": obj_x, "y": obj_y})
         self.publish_marker(found_type, obj_x, obj_y)
         self.get_logger().info(f"Stored {found_type} at ({obj_x:.2f}, {obj_y:.2f})")
 
-    # -------------- Motion and state machine --------------
+    # ---------------- Motion & state helpers ----------------
 
     def stop_robot(self):
-        twist = Twist()
-        self.cmd_pub.publish(twist)
-
-    def get_waypoint_error(self):
-        """
-        Calculates distance and yaw error to the ACTIVE current waypoint.
-        Returns (distance, yaw_error).
-        """
-        if self.have_pose and self.current_waypoint is not None:
-            goal_x, goal_y = self.current_waypoint
-            
-            dx = goal_x - self.robot_pose['x']
-            dy = goal_y - self.robot_pose['y']
-            distance = math.sqrt(dx**2 + dy**2)
-            
-            goal_yaw = math.atan2(dy, dx)
-            yaw_err = goal_yaw - self.robot_pose['yaw']
-            
-            # Normalize angle
-            while yaw_err > math.pi: yaw_err -= 2 * math.pi
-            while yaw_err < -math.pi: yaw_err += 2 * math.pi
-            
-            return distance, yaw_err
-        return None, None
+        self.cmd_pub.publish(Twist())
 
     def get_closest_waypoint(self):
-        """Finds the nearest unvisited waypoint to the robot"""
         if not self.unvisited_waypoints:
             return None
-        
-        closest_pt = None
-        min_dist = float('inf')
-        
+        best = None
+        best_d = float("inf")
         for pt in self.unvisited_waypoints:
-            dx = pt[0] - self.robot_pose['x']
-            dy = pt[1] - self.robot_pose['y']
-            d = math.sqrt(dx*dx + dy*dy)
-            
-            if d < min_dist:
-                min_dist = d
-                closest_pt = pt
-        
-        return closest_pt
+            dx = pt[0] - self.robot_pose["x"]
+            dy = pt[1] - self.robot_pose["y"]
+            d = math.hypot(dx, dy)
+            if d < best_d:
+                best_d = d
+                best = pt
+        return best
 
-    def get_distance_to_m_line(self):
-        """
-        Calculates perpendicular distance from current pose to the M-Line.
-        M-Line is defined from self.m_line_start to self.current_waypoint.
-        """
-        if self.m_line_start is None or self.current_waypoint is None:
-            return float('inf')
-        
-        p1 = np.array(self.m_line_start)
-        p2 = np.array(self.current_waypoint)
-        p3 = np.array([self.robot_pose['x'], self.robot_pose['y']])
-        
-        # Distance point p3 to line segment p1-p2 (or infinite line)
-        # Using cross product area / base formula
-        # d = |(p2-p1) x (p1-p3)| / |p2-p1|
-        
-        num = np.abs(np.cross(p2-p1, p1-p3))
-        den = np.linalg.norm(p2-p1)
-        
-        if den == 0: return float('inf')
-        return num / den
+    # ---------------- Main control loop ----------------
 
     def control_loop(self):
-        twist = Twist()
+        self.loop_count += 1
+        if self.loop_count % 20 == 0:
+            self.publish_waypoints()
 
         detection = self.current_detection
         front = self.front_distance
-        left = self.left_distance
 
-        # GLOBAL OBSTACLE CHECK (Emergency)
-        # Only override if we are truly about to crash and NOT already managing it in wall follow
-        if front is not None and front < self.collision_distance and self.state != "BUG2_WALL_FOLLOW":
-             # If too close, just reverse a bit or turn, simpler than state switch if we can help it
-             # But here we stick to the plan: if exploring and we hit something, Bug2 starts.
-             pass 
+        # ---- GLOBAL: object interrupt ----
+        if (
+            detection is not None
+            and self.state not in ["TURN_TO_OBJECT", "APPROACH_OBJECT", "BACKING_UP", "SPINNING_AWAY"]
+        ):
+            should_chase = True
+            if front is not None and self.have_pose:
+                est_x, est_y = self.estimate_object_position(detection, dist=front)
+                if self.is_duplicate_object(detection["type"], est_x, est_y, min_dist=1.5):
+                    should_chase = False
 
-        if self.state == "EXPLORE":
-            # 1. Waypoint Selection Logic
-            if self.have_pose and self.current_waypoint is None:
-                if self.unvisited_waypoints:
-                    self.current_waypoint = self.get_closest_waypoint()
-                    self.m_line_start = (self.robot_pose['x'], self.robot_pose['y'])
-                    self.get_logger().info(f"Targeting new waypoint: {self.current_waypoint}")
-                    self.get_logger().info(f"M-Line Start: {self.m_line_start}")
-                else:
-                    self.get_logger().info("All waypoints visited. Exploration complete.")
-                    twist.linear.x = 0.0
-                    twist.angular.z = 0.0
-                    self.cmd_pub.publish(twist)
-                    return
-
-            # Check for Objects (High Priority)
-            should_chase = False
-            if detection is not None:
-                should_chase = True
-                if front is not None and self.have_pose:
-                    est_x, est_y = self.estimate_object_position(detection, dist=front)
-                    if self.is_duplicate_object(detection['type'], est_x, est_y, min_dist=1.5):
-                        should_chase = False # Known object
-            
             if should_chase:
-                self.get_logger().info(f"New object detected: {detection['type']}")
+                self.get_logger().info(
+                    f"Object detected ({detection['type']}). Interrupting Nav2."
+                )
+                self.cancel_reason = "OBJECT"
+                if self.navigation_active:
+                    self.cancel_nav_goal()
                 self.state = "TURN_TO_OBJECT"
-                self.cmd_pub.publish(twist)
                 return
 
-            # EXPLORE: Move towards goal (Motion to Goal)
-            # If path blocked, Switch to Bug 2 Wall Follow
-            if front is not None and front < self.safe_forward_distance:
-                self.state = "BUG2_WALL_FOLLOW"
-                self.hit_point = (self.robot_pose['x'], self.robot_pose['y'])
-                
-                # Calculate distance to goal at hit point
-                dist, _ = self.get_waypoint_error()
-                self.dist_to_goal_at_hit = dist
-                
-                self.get_logger().info("Obstacle encountered! Switching to Bug 2 Wall Follow (Left).")
-                # Turn Right initially to put obstacle on Left
-                twist.linear.x = 0.0
-                twist.angular.z = -0.5
-                self.cmd_pub.publish(twist)
+        # ---- STATE MACHINE ----
+
+        if self.state == "IDLE":
+            if not self.have_pose:
+                if self.loop_count % 20 == 0:
+                    self.get_logger().info("Waiting for AMCL pose...")
                 return
 
-            # Normal Motion to Goal
-            if self.current_waypoint is not None:
-                dist, yaw_err = self.get_waypoint_error()
-                if dist is not None:
-                    if dist < self.waypoint_dist_tolerance:
-                        self.get_logger().info(f"Reached waypoint {self.current_waypoint}")
-                        if self.current_waypoint in self.unvisited_waypoints:
-                            self.unvisited_waypoints.remove(self.current_waypoint)
-                        self.current_waypoint = None 
-                    else:
-                        if abs(yaw_err) > self.waypoint_yaw_tolerance:
-                            twist.angular.z = 0.5 if yaw_err > 0 else -0.5
-                        else:
-                            twist.linear.x = self.max_linear_speed
-            elif not self.have_pose:
-                 self.get_logger().info("Waiting for AMCL pose...")
-
-        elif self.state == "BUG2_WALL_FOLLOW":
-            # BUG 2 LOGIC:
-            # 1. Follow Wall (Keep wall on Left)
-            # 2. Check if we are on M-Line AND closer to goal than hit_point
-            
-            # --- Wall Following Logic (Simple Bang-Bang / P-ish) ---
-            # Desired distance to wall
-            desired_dist = 0.6
-            
-            if front is not None and front < 0.5:
-                # Emergency turn right (Front blocked)
-                twist.linear.x = 0.0
-                twist.angular.z = -0.5
+            if self.unvisited_waypoints:
+                target = self.get_closest_waypoint()
+                self.current_waypoint = target
+                ok = self.send_nav_goal(target[0], target[1])
+                if ok:
+                    self.state = "NAVIGATING"
             else:
-                twist.linear.x = 0.15 # Move forward slowly
-                
-                if left is None or left > 1.0:
-                    # Wall lost or far away -> Turn Left to find it/circle it
-                    twist.angular.z = 0.4 
-                elif left < 0.4:
-                    # Too close -> Turn Right away
-                    twist.angular.z = -0.4
-                else:
-                    # In good range, small corrections
-                    err = desired_dist - left
-                    twist.angular.z = err * 1.0 
+                self.get_logger().info("All waypoints visited. Exploration complete.")
+                self.stop_robot()
 
-            # --- Bug 2 Leave Condition ---
-            dist_to_line = self.get_distance_to_m_line()
-            dist_to_goal, _ = self.get_waypoint_error()
-            
-            # Tolerance for "being on the line" (e.g. 10-20cm)
-            if dist_to_line < 0.2:
-                # Must be closer to goal than the point where we hit the obstacle
-                # Added small epsilon (0.1) to prevent immediate leave if sensor noise puts us 'slightly' closer
-                if dist_to_goal < (self.dist_to_goal_at_hit - 0.1):
-                    # And path towards goal should be somewhat clear (optional but safer)
-                    if front is None or front > 0.5:
-                        self.get_logger().info("Bug 2: Back on M-Line and closer! Resuming Explore.")
-                        self.state = "EXPLORE"
-                        twist.linear.x = 0.0
-                        twist.angular.z = 0.0
-        
+        elif self.state == "NAVIGATING":
+            # Just wait. 
+            # Nav2 is in control. feedback_callback handles tolerance check.
+            # result_callback handles state change to IDLE.
+            pass
+
         elif self.state == "TURN_TO_OBJECT":
+            twist = Twist()
             if detection is None:
-                self.state = "EXPLORE"
+                # Lost object, go back to Nav2
+                self.state = "IDLE"
             else:
                 offset = detection["offset"]
                 if abs(offset) < self.center_tolerance:
                     self.state = "APPROACH_OBJECT"
                 else:
                     twist.angular.z = -self.max_angular_speed * offset
+            self.cmd_pub.publish(twist)
 
         elif self.state == "APPROACH_OBJECT":
+            twist = Twist()
             if detection is None:
-                self.state = "EXPLORE"
+                # Lost object, return to Nav2
+                self.state = "IDLE"
             else:
                 offset = detection["offset"]
                 twist.angular.z = -self.max_angular_speed * offset
                 twist.linear.x = 0.1
-
+                # Stop at safe distance based on LIDAR
                 if front is not None and front < self.safe_object_distance:
                     self.stop_robot()
                     self.handle_new_detection(detection)
                     self.current_detection = None
                     self.state = "BACKING_UP"
                     self.backup_counter = 15
-                    self.get_logger().info("Object handled. Backing up...")
-                    return
+            self.cmd_pub.publish(twist)
 
         elif self.state == "BACKING_UP":
+            twist = Twist()
             if self.backup_counter > 0:
                 twist.linear.x = -0.1
                 self.backup_counter -= 1
             else:
                 self.state = "SPINNING_AWAY"
-                self.turn_away_counter = 30 
-                self.get_logger().info("Backing done. Spinning away...")
+                self.turn_away_counter = 30
+            self.cmd_pub.publish(twist)
 
         elif self.state == "SPINNING_AWAY":
+            twist = Twist()
             if self.turn_away_counter > 0:
                 twist.angular.z = self.max_angular_speed
                 self.turn_away_counter -= 1
             else:
-                self.state = "EXPLORE"
-                self.get_logger().info("Maneuver complete. Resuming waypoints.")
+                self.state = "IDLE"
+                self.get_logger().info("Manual object handling done. Resuming Nav2.")
+            self.cmd_pub.publish(twist)
 
-        self.cmd_pub.publish(twist)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -548,9 +617,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.stop_robot()
+        # Avoid publishing during shutdown to prevent RCLError
         node.destroy_node()
+        cv2.destroyAllWindows()
         rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
